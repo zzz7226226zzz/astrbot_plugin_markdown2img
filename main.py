@@ -1,20 +1,24 @@
 import os
 import re
 import uuid
-import traceback
-import sys
 from typing import List
+
 
 from astrbot.api import logger
 from astrbot.api.event import filter, AstrMessageEvent
 from astrbot.api.star import Context, Star, register
 from astrbot.core.message.components import Image, Plain
+from astrbot.core.provider.entities import LLMResponse, ProviderRequest
 from astrbot.core.star.star_tools import StarTools
 
 # 确保你已经安装了 mistune 和 playwright
 import mistune
 import asyncio
 from playwright.async_api import async_playwright
+import uuid
+
+import subprocess
+import sys
 
 
 async def markdown_to_image_playwright(
@@ -152,7 +156,7 @@ int main() {
 
 @register(
     "astrbot_plugin_md2img",
-    "tosaki",
+    "tosaki",  # Or your name
     "使用 /md 指令调用 LLM 并将结果渲染为 Markdown 图片",
     "1.1.0",
 )
@@ -162,118 +166,91 @@ class MarkdownConverterPlugin(Star):
         self.DATA_DIR = os.path.normpath(StarTools.get_data_dir())
         # 创建一个专门用于存放生成图片的缓存目录
         self.IMAGE_CACHE_DIR = os.path.join(self.DATA_DIR, "md2img_cache")
-        # Playwright 是否已就绪的标志
-        self._playwright_ready = False
-        self._playwright_installing = False
 
     async def initialize(self):
-        """初始化插件，确保图片缓存目录存在，并在后台安装 Playwright"""
+        """初始化插件，确保图片缓存目录和 Playwright 浏览器存在 (异步版本)"""
         try:
+            # os.makedirs is synchronous, but it's extremely fast and not a bottleneck.
+            # For a simple, one-off operation like this, it's fine to keep it.
             os.makedirs(self.IMAGE_CACHE_DIR, exist_ok=True)
-            logger.info("Markdown 转图片插件已初始化")
-            logger.info(f"图片缓存目录: {self.IMAGE_CACHE_DIR}")
-            
-            # 在后台启动 Playwright 安装任务，不阻塞插件加载
-            asyncio.create_task(self._install_playwright_background())
-            
-        except Exception as e:
-            logger.error(f"插件初始化过程中发生错误: {e}")
 
-    async def _install_playwright_background(self):
-        """后台安装 Playwright 浏览器"""
-        if self._playwright_installing:
-            return
-        self._playwright_installing = True
-        
-        try:
-            logger.info("正在后台检查并安装 Playwright Chromium 浏览器...")
+            logger.info("正在异步检查并安装 Playwright 浏览器依赖...")
             
-            # 安装 Chromium 浏览器
-            process = await asyncio.create_subprocess_exec(
-                sys.executable, "-m", "playwright", "install", "chromium",
-                stdout=asyncio.subprocess.PIPE,
-                stderr=asyncio.subprocess.PIPE
-            )
-            stdout, stderr = await process.communicate()
-            
-            if process.returncode == 0:
-                logger.info("Playwright Chromium 浏览器安装/检查完成")
-                self._playwright_ready = True
-            else:
-                error_msg = stderr.decode('utf-8', errors='ignore') if stderr else "未知错误"
-                logger.error(f"Playwright 安装失败: {error_msg}")
-                
-        except Exception as e:
-            logger.error(f"Playwright 后台安装异常: {e}")
-        finally:
-            self._playwright_installing = False
+            # This function starts a subprocess without blocking the event loop.
 
-    async def _ensure_playwright_ready(self) -> bool:
-        """确保 Playwright 已就绪，如果未就绪则等待安装完成"""
-        if self._playwright_ready:
-            return True
-            
-        # 如果正在安装，等待安装完成（最多等待 120 秒）
-        if self._playwright_installing:
-            for _ in range(120):
-                await asyncio.sleep(1)
-                if self._playwright_ready:
+            # Helper function to run a command and log its output
+            async def run_playwright_command(command: list, description: str):
+                process = await asyncio.create_subprocess_exec(
+                    *command,
+                    stdout=asyncio.subprocess.PIPE,
+                    stderr=asyncio.subprocess.PIPE
+                )
+
+                # Await the process to complete and capture the output
+                stdout, stderr = await process.communicate()
+
+                if process.returncode != 0:
+                    logger.error(
+                        f"自动安装 Playwright {description} 失败，返回码: {process.returncode}")
+                    if stderr:
+                        logger.error(
+                            f"错误输出: \n{stderr.decode('utf-8', errors='ignore')}")
+                    return False
+                else:
+                    output = stdout.decode('utf-8', errors='ignore')
+                    # Only log if there's meaningful output (e.g., not just "up to date")
+                    if "up to date" not in output:
+                        logger.info(
+                            f"Playwright {description} 安装/更新完成。\n{output}")
+                    else:
+                        logger.info(f"Playwright {description} 已是最新，无需下载。")
                     return True
-            return False
-        
-        # 如果既没就绪也没在安装，尝试安装
-        await self._install_playwright_background()
-        return self._playwright_ready
+
+            # Command to install chromium browser
+            install_browser_cmd = [sys.executable, "-m",
+                                   "playwright", "install", "chromium"]
+            await run_playwright_command(install_browser_cmd, "Chromium 浏览器")
+
+            # Command to install system dependencies
+            install_deps_cmd = [sys.executable,
+                                "-m", "playwright", "install-deps"]
+            await run_playwright_command(install_deps_cmd, "系统依赖")
+
+            logger.info("Markdown 转图片插件已初始化")
+
+        except FileNotFoundError:
+            # This error happens if 'python -m playwright' cannot be run
+            logger.error(
+                "无法执行 Playwright 安装命令。请检查 Playwright Python 包是否已正确安装。")
+        except Exception as e:
+            logger.error(f"插件初始化过程中发生未知错误: {e}")
 
     async def terminate(self):
         """插件停用时调用"""
         logger.info("Markdown 转图片插件已停止")
+    # ========== 仅通过 /md 指令触发的逻辑 ==========
 
     def _get_full_text_input(self, event: AstrMessageEvent, cmd_prefix: str = "") -> str:
-        """手动提取文本，支持图文混排，防止被截断"""
+        """提取纯文本消息，支持图文混排，去掉命令前缀"""
         full_text = ""
-        if hasattr(event, 'message_obj') and event.message_obj:
-            for component in event.message_obj.message:
-                if isinstance(component, Plain):
-                    full_text += component.text
+        if hasattr(event, "message_obj") and event.message_obj:
+            for comp in event.message_obj.message:
+                if isinstance(comp, Plain):
+                    full_text += comp.text
         full_text = full_text.strip()
         if cmd_prefix and full_text.startswith(cmd_prefix):
             full_text = full_text[len(cmd_prefix):].strip()
         return full_text
 
-    def _extract_markdown_robust(self, text: str) -> str:
-        """
-        强壮的 Markdown 提取逻辑：
-        1. 尝试匹配 <md>...</md>
-        2. 尝试匹配 <md>... (直到文本结束，处理 AI 忘写闭合标签的情况)
-        3. 如果都没找到，假定整段文本都是 Markdown (兜底策略)
-        """
-        # 模式：匹配 <md>...</md> 或 <md>...(到文本结束)
-        pattern = r"<md>(.*?)(?:</md>|$)"
-        match = re.search(pattern, text, re.DOTALL)
-        
-        if match:
-            content = match.group(1).strip()
-            if content:
-                return content
-        
-        # 兜底：如果没找到标签，直接返回原文本
-        logger.warning("未检测到 <md> 标签，将渲染全部文本。")
-        return text
-
     @filter.command("md")
-    async def cmd_md(self, event: AstrMessageEvent, ctx: Context = None):
-        """
-        指令: /md <内容>
-        说明: 让 LLM 回答并强制渲染为 Markdown 图片
-        """
-        # 1. 获取用户输入
+    async def cmd_md(self, event: AstrMessageEvent):
+        """/md 指令：调用 LLM，并将回答渲染为 Markdown 图片"""
+
         query = self._get_full_text_input(event, "/md")
         if not query:
             yield event.plain_result("请在 /md 后输入你想问的内容，例如：/md 帮我写一个快速排序算法")
             return
 
-        # 2. 获取当前会话的 Provider (LLM)
         provider = self.context.get_using_provider()
         if not provider:
             yield event.plain_result("未找到可用的 LLM Provider。")
@@ -281,84 +258,107 @@ class MarkdownConverterPlugin(Star):
 
         yield event.plain_result("✨ 正在生成 Markdown 渲染结果，请稍候...")
 
-        # 3. 构造系统提示词 (强约定版本)
+        # 加强版提示词：强制使用 <md> 包裹，且必须闭合
         instruction_prompt = """
-【强制任务指令 - 必须严格遵守】
-用户希望你以 Markdown 格式回答问题，该回答将被直接渲染为图片。
+【任务指令】
+你现在处于一个“Markdown 转图片”专用模式中，请严格按照以下规范回答：
 
-【格式要求 - 极其重要】
-1. 你必须使用丰富的 Markdown 语法（LaTeX公式、代码块、表格、列表）来优化排版。
-2. 【最重要】你必须将你的全部回答内容包裹在 <md> 开始标签和 </md> 结束标签之间。
-3. 【警告】不要忘记写结束标签 </md>！缺少结束标签会导致渲染失败！
-4. 标签外不要有任何内容，所有回答都必须在标签内。
+1. 你的核心回答内容必须完整地包裹在一对且仅一对 <md> 和 </md> 标签中，并且标签必须闭合：
+   - 开头必须是单独一行的：<md>
+   - 结尾必须是单独一行的：</md>
+2. <md> 与 </md> 中间的内容必须是合法的 Markdown，可以包含：标题、列表、表格、代码块、以及 LaTeX 公式等。
+3. 不要在 </md> 之后再追加其它解释性文本或额外内容。
+4. 如果你需要给出示例，也必须放在同一对 <md>...</md> 中，而不是额外再写一对标签。
 
-【正确格式示例】
+输出格式示例（务必遵守）：
 <md>
 # 标题
 
-这里是正文内容...
+这里是正文内容，可以包含列表、表格、代码块、以及公式：
 
-## 代码示例
 ```python
-print("Hello World")
+def hello():
+    print("hello markdown")
 ```
 
-## 数学公式
-$$ E = mc^2 $$
+行内公式示例：$E=mc^2$
 
+独立公式示例：
+$$
+\int_0^\infty e^{-x^2} dx = \frac{\sqrt{\pi}}{2}
+$$
 </md>
 
-【错误示例 - 禁止这样做】
-❌ 忘记写 </md> 结束标签
-❌ 在 <md> 标签外写内容
-❌ 使用其他格式的标签
-
-现在请严格按照上述格式回答用户的问题。
+【特别重要】如果你不能保证标签完整闭合，请直接拒绝回答并说明原因。
 """
 
-        # 4. 调用 LLM
         try:
-            # 直接调用 provider.text_chat，传入 prompt 和 system_prompt
-            response = await provider.text_chat(
-                prompt=query,
-                system_prompt=instruction_prompt
+            # 这里仍沿用 text 字段来传递用户问题，由底层 AstrBot 负责构造消息
+            req = ProviderRequest(
+                text=query,
+                session=event.session,
+                system_prompt_suffix=instruction_prompt,
             )
-            
-            if not response or not response.completion_text:
+
+            resp: LLMResponse = await provider.text_chat(req)
+            if not resp or not resp.completion_text:
                 yield event.plain_result("❌ LLM 未返回任何内容。")
                 return
-                
-            raw_text = response.completion_text
 
-            # 5. 提取 Markdown 内容（带容错）
+            raw_text = resp.completion_text
+
+            # 解析 <md> 标签（容错：没闭合或没写标签也尽量兜底）
             md_content = self._extract_markdown_robust(raw_text)
 
-            # 6. 确保 Playwright 已就绪
-            if not await self._ensure_playwright_ready():
-                yield event.plain_result("❌ Playwright 浏览器尚未安装完成，请稍后重试。")
-                return
-
-            # 7. 渲染图片
             image_filename = f"{uuid.uuid4()}.png"
             output_path = os.path.join(self.IMAGE_CACHE_DIR, image_filename)
-            
+
             await markdown_to_image_playwright(
                 md_text=md_content,
                 output_image_path=output_path,
                 scale=2,
-                width=600
+                width=600,
             )
 
-            # 8. 发送结果
             if os.path.exists(output_path):
                 yield event.image_result(output_path)
             else:
                 yield event.plain_result(f"❌ 渲染失败，原始文本：\n{md_content}")
 
         except Exception as e:
-            logger.error(f"MD渲染插件异常: {e}")
+            logger.error(f"MD 渲染插件异常: {e}")
+            import traceback
             logger.error(traceback.format_exc())
             yield event.plain_result(f"❌ 处理请求时发生错误: {e}")
+
+    def _extract_markdown_robust(self, text: str) -> str:
+        """更强壮的 <md> 标签内容提取逻辑。
+
+        1. 优先匹配完整的 <md>...</md>（非贪婪）
+        2. 若找不到闭合标签，则匹配从 <md> 到文本结束
+        3. 若连 <md> 都没有，则直接将整个文本当作 Markdown 返回
+        """
+
+        # 优先匹配完整的 <md>...</md>
+        pattern_full = r"<md>(.*?)(?:</md>)"
+        m = re.search(pattern_full, text, flags=re.DOTALL)
+        if m:
+            content = m.group(1).strip()
+            if content:
+                return content
+
+        # 其次：只找到 <md>，但没写 </md>，那就从 <md> 一直到结尾
+        pattern_start_only = r"<md>(.*)$"
+        m2 = re.search(pattern_start_only, text, flags=re.DOTALL)
+        if m2:
+            content = m2.group(1).strip()
+            if content:
+                logger.warning("检测到 <md> 但缺少 </md>，已自动截取到文本末尾。")
+                return content
+
+        # 兜底：没有任何 <md> 标签，就直接返回原始文本
+        logger.warning("未检测到 <md> 标签，将把完整回答当作 Markdown 渲染。")
+        return text
     
 
 if __name__ == "__main__":
