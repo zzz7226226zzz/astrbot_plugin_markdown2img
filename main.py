@@ -3,18 +3,20 @@ import re
 import uuid
 from typing import List
 
+
 from astrbot.api import logger
 from astrbot.api.event import filter, AstrMessageEvent
 from astrbot.api.star import Context, Star, register
 from astrbot.core.message.components import Image, Plain
 from astrbot.core.provider.entities import LLMResponse, ProviderRequest
 from astrbot.core.star.star_tools import StarTools
-from astrbot.core.star.filter.command import GreedyStr
 
 # 确保你已经安装了 mistune 和 playwright
 import mistune
 import asyncio
 from playwright.async_api import async_playwright
+import uuid
+
 import subprocess
 import sys
 
@@ -33,10 +35,13 @@ async def markdown_to_image_playwright(
     :param scale: 渲染的缩放因子。大于 1 的值可以有效提升清晰度和抗锯齿效果。
     :param width: 图片内容的固定宽度（单位：像素）。如果为 None，则宽度自适应内容。
     """
+    # 1. 根据是否提供了 width 参数，动态生成 body 的宽度样式
     width_style = ""
     if width:
+        # box-sizing: border-box 可确保 padding 包含在设定的 width 内
         width_style = f"width: {width}px; box-sizing: border-box;"
 
+    # 2. 改进的 HTML 模板，为 body 样式增加了一个占位符 {width_style}
     html_template = """
     <!DOCTYPE html>
     <html>
@@ -45,15 +50,18 @@ async def markdown_to_image_playwright(
         <title>Markdown Render</title>
         <style>
             body {{
-                {width_style}
+                {width_style} /* 宽度样式将在这里注入 */
                 font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Helvetica, Arial, sans-serif, "Apple Color Emoji", "Segoe UI Emoji";
                 padding: 25px;
-                display: inline-block;
+                display: inline-block; /* 让截图尺寸自适应内容 */
                 font-size: 16px;
+
+                /* 开启更平滑的字体渲染 */
                 -webkit-font-smoothing: antialiased;
                 -moz-osx-font-smoothing: grayscale;
                 text-rendering: optimizeLegibility;
             }}
+            /* 为代码块添加一些样式 */
             pre {{
                 background-color: #f6f8fa;
                 border-radius: 6px;
@@ -89,20 +97,29 @@ async def markdown_to_image_playwright(
     </html>
     """
 
+    # 3. 将 Markdown 转换为 HTML
     html_content = mistune.html(md_text)
-    full_html = html_template.format(content=html_content, width_style=width_style)
 
+    # 4. 填充 HTML 模板，同时传入内容和宽度样式
+    full_html = html_template.format(
+        content=html_content, width_style=width_style)
+
+    # 5. 使用 Playwright 进行截图
     async with async_playwright() as p:
         browser = await p.chromium.launch()
-        context = await browser.new_context(device_scale_factor=scale)
+        context = await browser.new_context(
+            device_scale_factor=scale
+        )
         page = await context.new_page()
+
         await page.set_content(full_html, wait_until="networkidle")
 
+        # 更稳健地等待 MathJax 渲染完成
         try:
             await page.evaluate("MathJax.Hub.Queue(['Typeset', MathJax.Hub])")
             await page.wait_for_function("typeof MathJax.Hub.Queue.running === 'undefined' || MathJax.Hub.Queue.running === 0")
         except Exception as e:
-            print(f"等待 MathJax 时出错: {e}")
+            print(f"等待 MathJax 时出错 (可能是页面加载太快): {e}")
 
         element_handle = await page.query_selector('body')
         if not element_handle:
@@ -113,53 +130,100 @@ async def markdown_to_image_playwright(
         print(f"图片已保存到: {output_image_path}")
 
 
+# --- 示例 ---
+markdown_string = """
+# Playwright 渲染测试
+
+这是一个宽度被设置为 600px 的示例。当文本内容足够长时，它会自动换行以适应设定的宽度。
+
+行内公式 $a^2 + b^2 = c^2$。
+
+独立公式：
+$$
+\\int_0^\\infty e^{-x^2} dx = \\frac{\\sqrt{\pi}}{2}
+$$
+
+以及一段 C++ 代码:
+```cpp
+#include <iostream>
+
+int main() {
+    // 这是一段注释，用来增加代码块的宽度，以测试在固定宽度下的显示效果。
+    std::cout << "Hello, C++! This is a longer line to demonstrate wrapping or scrolling." << std::endl;
+    return 0;
+}
+"""
+
 @register(
     "astrbot_plugin_md2img",
-    "tosaki",
-    "使用 /md 指令调用 LLM 并将结果渲染为 Markdown 图片",
-    "1.1.0",
+    "tosaki",  # Or your name
+    "允许LLM将Markdown文本转换为图片发送",
+    "1.0.0",
 )
 class MarkdownConverterPlugin(Star):
     def __init__(self, context: Context):
         super().__init__(context)
         self.DATA_DIR = os.path.normpath(StarTools.get_data_dir())
+        # 创建一个专门用于存放生成图片的缓存目录
         self.IMAGE_CACHE_DIR = os.path.join(self.DATA_DIR, "md2img_cache")
+        # 用于存储已启用 md2img 功能的会话 ID
+        self._enabled_sessions = set()
 
     async def initialize(self):
-        """初始化插件，确保图片缓存目录和 Playwright 浏览器存在"""
+        """初始化插件，确保图片缓存目录和 Playwright 浏览器存在 (异步版本)"""
         try:
+            # os.makedirs is synchronous, but it's extremely fast and not a bottleneck.
+            # For a simple, one-off operation like this, it's fine to keep it.
             os.makedirs(self.IMAGE_CACHE_DIR, exist_ok=True)
-            logger.info("正在检查并安装 Playwright 浏览器...")
+
+            logger.info("正在异步检查并安装 Playwright 浏览器依赖...")
             
+            # This function starts a subprocess without blocking the event loop.
+
+            # Helper function to run a command and log its output
             async def run_playwright_command(command: list, description: str):
                 process = await asyncio.create_subprocess_exec(
                     *command,
                     stdout=asyncio.subprocess.PIPE,
                     stderr=asyncio.subprocess.PIPE
                 )
+
+                # Await the process to complete and capture the output
                 stdout, stderr = await process.communicate()
 
                 if process.returncode != 0:
-                    logger.error(f"Playwright {description} 安装失败，返回码: {process.returncode}")
+                    logger.error(
+                        f"自动安装 Playwright {description} 失败，返回码: {process.returncode}")
                     if stderr:
-                        logger.error(f"错误输出: \n{stderr.decode('utf-8', errors='ignore')}")
+                        logger.error(
+                            f"错误输出: \n{stderr.decode('utf-8', errors='ignore')}")
                     return False
                 else:
                     output = stdout.decode('utf-8', errors='ignore')
+                    # Only log if there's meaningful output (e.g., not just "up to date")
                     if "up to date" not in output:
-                        logger.info(f"Playwright {description} 安装完成")
+                        logger.info(
+                            f"Playwright {description} 安装/更新完成。\n{output}")
                     else:
-                        logger.info(f"Playwright {description} 已是最新")
+                        logger.info(f"Playwright {description} 已是最新，无需下载。")
                     return True
 
-            # 只安装 Chromium 浏览器，不执行 install-deps（避免在 Docker 中 dpkg 锁冲突）
-            install_browser_cmd = [sys.executable, "-m", "playwright", "install", "chromium"]
+            # Command to install chromium browser
+            install_browser_cmd = [sys.executable, "-m",
+                                   "playwright", "install", "chromium"]
             await run_playwright_command(install_browser_cmd, "Chromium 浏览器")
+
+            # Command to install system dependencies
+            install_deps_cmd = [sys.executable,
+                                "-m", "playwright", "install-deps"]
+            await run_playwright_command(install_deps_cmd, "系统依赖")
 
             logger.info("Markdown 转图片插件已初始化")
 
         except FileNotFoundError:
-            logger.error("无法执行 Playwright 安装命令。请检查 Playwright Python 包是否已正确安装。")
+            # This error happens if 'python -m playwright' cannot be run
+            logger.error(
+                "无法执行 Playwright 安装命令。请检查 Playwright Python 包是否已正确安装。")
         except Exception as e:
             logger.error(f"插件初始化过程中发生未知错误: {e}")
 
@@ -167,114 +231,223 @@ class MarkdownConverterPlugin(Star):
         """插件停用时调用"""
         logger.info("Markdown 转图片插件已停止")
 
+    def _get_session_id(self, event: AstrMessageEvent) -> str:
+        """获取会话的唯一标识符"""
+        return event.unified_msg_origin
+
     @filter.command("md")
-    async def cmd_md(self, event: AstrMessageEvent, query: GreedyStr = ""):
-        """/md <内容> - 调用 LLM 并将回答渲染为 Markdown 图片"""
+    async def cmd_md(self, event: AstrMessageEvent):
+        """处理 /md 指令，启用或禁用当前会话的 markdown 转图片功能"""
+        session_id = self._get_session_id(event)
+        
+        if session_id in self._enabled_sessions:
+            self._enabled_sessions.discard(session_id)
+            yield event.plain_result("✅ Markdown 转图片功能已关闭")
+        else:
+            self._enabled_sessions.add(session_id)
+            yield event.plain_result("✅ Markdown 转图片功能已开启\n\nLLM 将在需要时自动使用图片渲染复杂的 Markdown 内容。\n再次发送 /md 可关闭此功能。")
 
-        if not query:
-            yield event.plain_result("请在 /md 后输入你想问的内容，例如：/md 帮我写一个快速排序算法")
+    @filter.on_llm_request()
+    async def on_llm_req(self, event: AstrMessageEvent, req: ProviderRequest):
+        """向 LLM 注入使用 Markdown 转图片功能的指令（仅在启用时）"""
+        session_id = self._get_session_id(event)
+        
+        # 只有在会话启用了 md2img 功能时才注入 prompt
+        if session_id not in self._enabled_sessions:
             return
-
-        provider = self.context.get_using_provider()
-        if not provider:
-            yield event.plain_result("未找到可用的 LLM Provider。")
-            return
-
-        yield event.plain_result("✨ 正在生成 Markdown 渲染结果，请稍候...")
-
+        
         instruction_prompt = """
-【任务指令】
-你现在处于一个"Markdown 转图片"专用模式中，请严格按照以下规范回答：
+当你需要发送包含复杂格式（如代码块、表格、嵌套列表等）的内容时，为了获得更好的显示效果，你可以将这部分内容渲染成一张图片。
 
-1. 你的核心回答内容必须完整地包裹在一对且仅一对 <md> 和 </md> 标签中，并且标签必须闭合：
-   - 开头必须是单独一行的：<md>
-   - 结尾必须是单独一行的：</md>
-2. <md> 与 </md> 中间的内容必须是合法的 Markdown，可以包含：标题、列表、表格、代码块、以及 LaTeX 公式等。
-3. 不要在 </md> 之后再追加其它解释性文本或额外内容。
-4. 如果你需要给出示例，也必须放在同一对 <md>...</md> 中，而不是额外再写一对标签。
+【重要】使用规则：
+1. 将你需要转换为图片的 Markdown 全文内容包裹在 `<md>` 和 `</md>` 标签之间。
+2. **必须严格确保标签闭合**：每个 `<md>` 标签必须有且仅有一个对应的 `</md>` 标签。
+3. **标签必须独占一行**：`<md>` 和 `</md>` 标签应各自单独占据一行，不要与其他内容混在同一行。
+4. **标签内不能嵌套**：`<md>` 标签内部不能再包含 `<md>` 或 `</md>` 标签。
+5. 标签内的内容应为完整的、格式正确的 Markdown 文本。
+6. 请自行判断何时使用该功能，通常用于格式复杂、纯文本难以阅读的场景。
 
-输出格式示例（务必遵守）：
+正确示例：
 <md>
-# 标题
+# 这是一个标题
 
-这里是正文内容，可以包含列表、表格、代码块、以及公式：
+这是一个列表:
+- 列表项 1
+- 列表项 2
 
+这是一个代码块:
 ```python
-def hello():
-    print("hello markdown")
+def hello_world():
+    print("Hello, World!")
 ```
-
-行内公式示例：$E=mc^2$
-
-独立公式示例：
-$$
-\int_0^\infty e^{-x^2} dx = \frac{\sqrt{\pi}}{2}
-$$
 </md>
 
-【特别重要】如果你不能保证标签完整闭合，请直接拒绝回答并说明原因。
+错误示例（不要这样做）：
+- 标签不闭合：`<md> 内容没有结束标签`
+- 标签嵌套：`<md> <md> 内容 </md> </md>`
+- 标签不独占一行：`一些文字<md>内容</md>其他文字`
 """
+        # 将指令添加到 system prompt 的末尾
+        req.system_prompt += f"\n\n{instruction_prompt}"
 
-        try:
-            req = ProviderRequest(
-                prompt=query,
-                session_id=event.session_id,
-                system_prompt=instruction_prompt,
-            )
+    @filter.on_llm_response()
+    async def on_llm_resp(self, event: AstrMessageEvent, resp: LLMResponse):
+        """将原始响应暂存，以便后续处理（仅在启用时）"""
+        session_id = self._get_session_id(event)
+        
+        # 只有在会话启用了 md2img 功能时才保存
+        if session_id not in self._enabled_sessions:
+            return
+            
+        # 这一步是为了将 LLM 的原始响应（可能包含<md>标签）保存到事件上下文中
+        event.set_extra("raw_llm_completion_text", resp.completion_text)
 
-            resp: LLMResponse = await provider.text_chat(req)
-            if not resp or not resp.completion_text:
-                yield event.plain_result("❌ LLM 未返回任何内容。")
-                return
-
-            raw_text = resp.completion_text
-            md_content = self._extract_markdown_robust(raw_text)
-
-            image_filename = f"{uuid.uuid4()}.png"
-            output_path = os.path.join(self.IMAGE_CACHE_DIR, image_filename)
-
-            await markdown_to_image_playwright(
-                md_text=md_content,
-                output_image_path=output_path,
-                scale=2,
-                width=600,
-            )
-
-            if os.path.exists(output_path):
-                yield event.image_result(output_path)
+    @filter.on_decorating_result()
+    async def on_decorating_result(self, event: AstrMessageEvent):
+        """在最终消息链生成阶段，解析并替换 <md> 标签（仅在启用时）"""
+        session_id = self._get_session_id(event)
+        
+        # 只有在会话启用了 md2img 功能时才处理
+        if session_id not in self._enabled_sessions:
+            return
+            
+        result = event.get_result()
+        # 检查 result 是否存在且有 chain
+        if result is None or not result.chain:
+            return
+            
+        chain = result.chain
+        new_chain = []
+        for item in chain:
+            # 我们只处理纯文本部分
+            if isinstance(item, Plain):
+                # 调用核心处理函数
+                components = await self._process_text_with_markdown(item.text)
+                new_chain.extend(components)
             else:
-                yield event.plain_result(f"❌ 渲染失败，原始文本：\n{md_content}")
+                new_chain.append(item)
+        result.chain = new_chain
 
-        except Exception as e:
-            logger.error(f"MD 渲染插件异常: {e}")
-            import traceback
-            logger.error(traceback.format_exc())
-            yield event.plain_result(f"❌ 处理请求时发生错误: {e}")
-
-    def _extract_markdown_robust(self, text: str) -> str:
-        """更强壮的 <md> 标签内容提取逻辑。
-
-        1. 优先匹配完整的 <md>...</md>（非贪婪）
-        2. 若找不到闭合标签，则匹配从 <md> 到文本结束
-        3. 若连 <md> 都没有，则直接将整个文本当作 Markdown 返回
+    def _clean_unclosed_md_tags(self, text: str) -> str:
         """
-        # 优先匹配完整的 <md>...</md>
-        pattern_full = r"<md>(.*?)(?:</md>)"
-        m = re.search(pattern_full, text, flags=re.DOTALL)
-        if m:
-            content = m.group(1).strip()
-            if content:
-                return content
+        清理未闭合的 md 标签，将其转换为可读的文本格式，避免显示格式错误。
+        """
+        # 尝试修复：将未闭合的 <md> 替换为可读提示
+        # 首先找到所有完整闭合的标签对
+        closed_pattern = r'<md>(.*?)</md>'
+        
+        # 保护已闭合的标签，暂时替换为占位符
+        placeholders = {}
+        counter = [0]
+        
+        def save_closed(match):
+            key = f"__MD_PLACEHOLDER_{counter[0]}__"
+            placeholders[key] = match.group(0)
+            counter[0] += 1
+            return key
+        
+        protected_text = re.sub(closed_pattern, save_closed, text, flags=re.DOTALL)
+        
+        # 清理剩余的未闭合标签
+        # 替换孤立的 <md> 为 "[Markdown开始]"
+        protected_text = re.sub(r'<md>', '[Markdown内容开始]', protected_text)
+        # 替换孤立的 </md> 为 "[Markdown结束]"
+        protected_text = re.sub(r'</md>', '[Markdown内容结束]', protected_text)
+        
+        # 恢复已闭合的标签
+        for key, value in placeholders.items():
+            protected_text = protected_text.replace(key, value)
+        
+        return protected_text
 
-        # 其次：只找到 <md>，但没写 </md>，那就从 <md> 一直到结尾
-        pattern_start_only = r"<md>(.*)$"
-        m2 = re.search(pattern_start_only, text, flags=re.DOTALL)
-        if m2:
-            content = m2.group(1).strip()
-            if content:
-                logger.warning("检测到 <md> 但缺少 </md>，已自动截取到文本末尾。")
-                return content
+    async def _process_text_with_markdown(self, text: str) -> List:
+        """
+        处理包含 <md>...</md> 标签的文本。
+        将其分割成 Plain 和 Image 组件的列表。
+        增加了强约束校验，确保标签完美闭合。
+        """
+        components = []
+        
+        # 先进行标签校验
+        open_count = len(re.findall(r'<md>', text))
+        close_count = len(re.findall(r'</md>', text))
+        
+        # 如果标签数量不匹配，直接返回原文本，不进行处理
+        if open_count != close_count:
+            logger.warning(f"Markdown 标签不匹配: <md> 出现 {open_count} 次, </md> 出现 {close_count} 次。将原样输出文本。")
+            # 移除未闭合的标签，避免显示格式错误
+            cleaned_text = self._clean_unclosed_md_tags(text)
+            return [Plain(cleaned_text)]
+        
+        # 检查是否存在嵌套标签（简化检测：检查标签之间是否有另一个开始标签）
+        nested_pattern = r'<md>[^<]*<md>'
+        if re.search(nested_pattern, text, flags=re.DOTALL):
+            logger.warning("检测到嵌套的 <md> 标签，将原样输出文本。")
+            cleaned_text = self._clean_unclosed_md_tags(text)
+            return [Plain(cleaned_text)]
+        
+        # 使用更严格的正则表达式来匹配完整闭合的标签
+        # 确保 <md> 和 </md> 是完整的标签
+        pattern = r"(<md>.*?</md>)"
+        parts = re.split(pattern, text, flags=re.DOTALL)
 
-        # 兜底：没有任何 <md> 标签，就直接返回原始文本
-        logger.warning("未检测到 <md> 标签，将把完整回答当作 Markdown 渲染。")
-        return text
+        for part in parts:
+            part = part.strip()
+            if not part:
+                continue
+
+            # 检查当前部分是否是 <md> 标签
+            if part.startswith("<md>") and part.endswith("</md>"):
+                # 提取标签内的 Markdown 内容
+                md_content = part[4:-5].strip()
+                if not md_content:
+                    continue
+
+                # 生成一个唯一的图片文件名
+                image_filename = f"{uuid.uuid4()}.png"
+                output_path = os.path.join(self.IMAGE_CACHE_DIR, image_filename)
+
+                try:
+                    # 调用库函数生成图片
+                    await markdown_to_image_playwright(
+                        md_text=md_content,
+                        output_image_path=output_path,
+                        scale=2,  # 2倍缩放以获得更高清的图片
+                        width=600  # 固定宽度为600px，内容过长会自动换行
+                    )
+
+                    if os.path.exists(output_path):
+                        # 如果图片成功生成，则添加到组件列表中
+                        components.append(Image.fromFileSystem(output_path))
+                    else:
+                        # 如果生成失败，则将原始 Markdown 内容作为纯文本发送
+                        logger.error(f"Markdown 图片生成失败，但文件未找到: {output_path}")
+                        components.append(Plain(f"--- Markdown 渲染失败 ---\n{md_content}"))
+                except Exception as e:
+                    logger.error(f"调用 sync_markdown_to_image_playwright 异常: {e}")
+                    # 如果转换过程中发生异常，也回退到纯文本
+                    components.append(Plain(f"--- Markdown 渲染异常 ---\n{md_content}"))
+            else:
+                # 如果不是标签，就是普通文本
+                components.append(Plain(part))
+
+        return components
+    
+
+if __name__ == "__main__":
+    # 生成一个固定宽度的图片
+    output_file_fixed_width = f"markdown_width_{uuid.uuid4().hex[:6]}.png"
+    asyncio.run(markdown_to_image_playwright(
+        markdown_string,
+        output_file_fixed_width,
+        scale=2,
+        width=1000  # 设置宽度为 600px
+    ))
+
+    # 生成一个自适应宽度的图片(不设置 width 参数)
+    output_file_auto_width = f"markdown_auto_{uuid.uuid4().hex[:6]}.png"
+    asyncio.run(markdown_to_image_playwright(
+        markdown_string,
+        output_file_auto_width,
+        scale=2
+    ))
