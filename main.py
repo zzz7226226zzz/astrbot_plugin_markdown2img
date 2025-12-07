@@ -1,101 +1,157 @@
 import os
 import re
 import uuid
-import sys
-import asyncio
-import importlib
+import traceback
 from typing import List
-
-import mistune
-from playwright.async_api import async_playwright
 
 from astrbot.api import logger
 from astrbot.api.event import filter, AstrMessageEvent
 from astrbot.api.star import Context, Star, register
-try:
-    from astrbot.core.message.message import AstrMessage  # <--- 新增这行
-except Exception:
-    # 回退实现：在没有 astrbot 包的开发/静态检查环境中使用一个轻量级替代品
-    class AstrMessage:
-        def __init__(self, chain=None):
-            self.chain = chain or []
 from astrbot.core.message.components import Image, Plain
-from astrbot.core.provider.entities import ProviderRequest
 from astrbot.core.star.star_tools import StarTools
 
-# 尝试导入 GreedyStr，兼容环境
-try:
-    _command_module = importlib.import_module("astrbot.core.star.filter.command")
-    GreedyStr = getattr(_command_module, "GreedyStr")
-except Exception:
-    class GreedyStr(str): pass
+# 确保你已经安装了 mistune 和 playwright
+import mistune
+import asyncio
+from playwright.async_api import async_playwright
+import uuid
 
-# --- Playwright 渲染核心逻辑 (保持不变) ---
+import subprocess
+import sys
+
+
 async def markdown_to_image_playwright(
     md_text: str,
     output_image_path: str,
     scale: int = 2,
     width: int = None
 ):
-    """(这部分代码与你提供的一致，为节省篇幅省略，请保留原有的 HTML 模板和逻辑)"""
-    # ... 请保留你原代码中的 html_template 和渲染逻辑 ...
-    # 为了完整运行，这里我只写核心部分，实际使用时请将你原代码的 markdown_to_image_playwright 完整粘贴在这里
-    
-    width_style = f"width: {width}px; box-sizing: border-box;" if width else ""
-    
+    """
+    使用 Playwright 将包含 LaTeX 的 Markdown 转换为图片。
+
+    :param md_text: Markdown 格式的字符串。
+    :param output_image_path: 图片输出路径。
+    :param scale: 渲染的缩放因子。大于 1 的值可以有效提升清晰度和抗锯齿效果。
+    :param width: 图片内容的固定宽度（单位：像素）。如果为 None，则宽度自适应内容。
+    """
+    # 1. 根据是否提供了 width 参数，动态生成 body 的宽度样式
+    width_style = ""
+    if width:
+        # box-sizing: border-box 可确保 padding 包含在设定的 width 内
+        width_style = f"width: {width}px; box-sizing: border-box;"
+
+    # 2. 改进的 HTML 模板，为 body 样式增加了一个占位符 {width_style}
     html_template = """
     <!DOCTYPE html>
     <html>
     <head>
         <meta charset="UTF-8">
+        <title>Markdown Render</title>
         <style>
             body {{
-                {width_style}
-                font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, Helvetica, Arial, sans-serif;
-                padding: 20px;
-                display: inline-block;
+                {width_style} /* 宽度样式将在这里注入 */
+                font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Helvetica, Arial, sans-serif, "Apple Color Emoji", "Segoe UI Emoji";
+                padding: 25px;
+                display: inline-block; /* 让截图尺寸自适应内容 */
                 font-size: 16px;
-                line-height: 1.6;
+
+                /* 开启更平滑的字体渲染 */
+                -webkit-font-smoothing: antialiased;
+                -moz-osx-font-smoothing: grayscale;
+                text-rendering: optimizeLegibility;
             }}
-            pre {{ background: #f6f8fa; padding: 16px; border-radius: 6px; overflow: auto; }}
-            img {{ max-width: 100%; }}
-            table {{ border-collapse: collapse; width: 100%; }}
-            th, td {{ border: 1px solid #dfe2e5; padding: 6px 13px; }}
-            tr:nth-child(2n) {{ background-color: #f6f8fa; }}
+            /* 为代码块添加一些样式 */
+            pre {{
+                background-color: #f6f8fa;
+                border-radius: 6px;
+                padding: 16px;
+                overflow: auto;
+                font-size: 85%;
+                line-height: 1.45;
+            }}
+            code {{
+                font-family: "SFMono-Regular", Consolas, "Liberation Mono", Menlo, monospace;
+            }}
         </style>
-        <script type="text/javascript" async src="https://cdnjs.cloudflare.com/ajax/libs/mathjax/2.7.7/MathJax.js?config=TeX-MML-AM_CHTML"></script>
+        <script type="text/javascript" async
+            src="https://cdnjs.cloudflare.com/ajax/libs/mathjax/2.7.7/MathJax.js?config=TeX-MML-AM_CHTML">
+        </script>
         <script type="text/x-mathjax-config">
             MathJax.Hub.Config({{
-                tex2jax: {{ inlineMath: [['$','$']], displayMath: [['$$','$$']] }},
-                "HTML-CSS": {{ linebreaks: {{ automatic: true }} }},
+                tex2jax: {{
+                    inlineMath: [['$','$']],
+                    displayMath: [['$$','$$']],
+                }},
+                "HTML-CSS": {{
+                    scale: 100,
+                    linebreaks: {{ automatic: true }}
+                }},
                 SVG: {{ linebreaks: {{ automatic: true }} }}
             }});
         </script>
     </head>
-    <body>{content}</body>
+    <body>
+        {content}
+    </body>
     </html>
     """
-    
-    html_content = mistune.html(md_text)
-    full_html = html_template.format(content=html_content, width_style=width_style)
 
+    # 3. 将 Markdown 转换为 HTML
+    html_content = mistune.html(md_text)
+
+    # 4. 填充 HTML 模板，同时传入内容和宽度样式
+    full_html = html_template.format(
+        content=html_content, width_style=width_style)
+
+    # 5. 使用 Playwright 进行截图
     async with async_playwright() as p:
         browser = await p.chromium.launch()
-        context = await browser.new_context(device_scale_factor=scale)
+        context = await browser.new_context(
+            device_scale_factor=scale
+        )
         page = await context.new_page()
+
         await page.set_content(full_html, wait_until="networkidle")
+
+        # 更稳健地等待 MathJax 渲染完成
         try:
             await page.evaluate("MathJax.Hub.Queue(['Typeset', MathJax.Hub])")
-            # 简单等待一下 MathJax
-            await page.wait_for_timeout(1000) 
-        except Exception:
-            pass
-        
-        element = await page.query_selector('body')
-        if element:
-            await element.screenshot(path=output_image_path)
-        await browser.close()
+            await page.wait_for_function("typeof MathJax.Hub.Queue.running === 'undefined' || MathJax.Hub.Queue.running === 0")
+        except Exception as e:
+            print(f"等待 MathJax 时出错 (可能是页面加载太快): {e}")
 
+        element_handle = await page.query_selector('body')
+        if not element_handle:
+            raise Exception("无法找到 <body> 元素进行截图。")
+
+        await element_handle.screenshot(path=output_image_path)
+        await browser.close()
+        print(f"图片已保存到: {output_image_path}")
+
+
+# --- 示例 ---
+markdown_string = """
+# Playwright 渲染测试
+
+这是一个宽度被设置为 600px 的示例。当文本内容足够长时，它会自动换行以适应设定的宽度。
+
+行内公式 $a^2 + b^2 = c^2$。
+
+独立公式：
+$$
+\\int_0^\\infty e^{-x^2} dx = \\frac{\\sqrt{\pi}}{2}
+$$
+
+以及一段 C++ 代码:
+```cpp
+#include <iostream>
+
+int main() {
+    // 这是一段注释，用来增加代码块的宽度，以测试在固定宽度下的显示效果。
+    std::cout << "Hello, C++! This is a longer line to demonstrate wrapping or scrolling." << std::endl;
+    return 0;
+}
+"""
 
 @register(
     "astrbot_plugin_md2img",
@@ -107,15 +163,70 @@ class MarkdownConverterPlugin(Star):
     def __init__(self, context: Context):
         super().__init__(context)
         self.DATA_DIR = os.path.normpath(StarTools.get_data_dir())
+        # 创建一个专门用于存放生成图片的缓存目录
         self.IMAGE_CACHE_DIR = os.path.join(self.DATA_DIR, "md2img_cache")
 
     async def initialize(self):
-        """初始化：检查目录和 Playwright 环境"""
-        os.makedirs(self.IMAGE_CACHE_DIR, exist_ok=True)
-        # 这里保留你的 Playwright 自动安装逻辑，非常棒
-        # ... (为简洁省略，请保留原代码中的 initialize 内容) ...
-        # 如果需要，可以将原代码的 install 逻辑放回这里
-        pass
+        """初始化插件，确保图片缓存目录和 Playwright 浏览器存在 (异步版本)"""
+        try:
+            # os.makedirs is synchronous, but it's extremely fast and not a bottleneck.
+            # For a simple, one-off operation like this, it's fine to keep it.
+            os.makedirs(self.IMAGE_CACHE_DIR, exist_ok=True)
+
+            logger.info("正在异步检查并安装 Playwright 浏览器依赖...")
+            
+            # This function starts a subprocess without blocking the event loop.
+
+            # Helper function to run a command and log its output
+            async def run_playwright_command(command: list, description: str):
+                process = await asyncio.create_subprocess_exec(
+                    *command,
+                    stdout=asyncio.subprocess.PIPE,
+                    stderr=asyncio.subprocess.PIPE
+                )
+
+                # Await the process to complete and capture the output
+                stdout, stderr = await process.communicate()
+
+                if process.returncode != 0:
+                    logger.error(
+                        f"自动安装 Playwright {description} 失败，返回码: {process.returncode}")
+                    if stderr:
+                        logger.error(
+                            f"错误输出: \n{stderr.decode('utf-8', errors='ignore')}")
+                    return False
+                else:
+                    output = stdout.decode('utf-8', errors='ignore')
+                    # Only log if there's meaningful output (e.g., not just "up to date")
+                    if "up to date" not in output:
+                        logger.info(
+                            f"Playwright {description} 安装/更新完成。\n{output}")
+                    else:
+                        logger.info(f"Playwright {description} 已是最新，无需下载。")
+                    return True
+
+            # Command to install chromium browser
+            install_browser_cmd = [sys.executable, "-m",
+                                   "playwright", "install", "chromium"]
+            await run_playwright_command(install_browser_cmd, "Chromium 浏览器")
+
+            # Command to install system dependencies
+            install_deps_cmd = [sys.executable,
+                                "-m", "playwright", "install-deps"]
+            await run_playwright_command(install_deps_cmd, "系统依赖")
+
+            logger.info("Markdown 转图片插件已初始化")
+
+        except FileNotFoundError:
+            # This error happens if 'python -m playwright' cannot be run
+            logger.error(
+                "无法执行 Playwright 安装命令。请检查 Playwright Python 包是否已正确安装。")
+        except Exception as e:
+            logger.error(f"插件初始化过程中发生未知错误: {e}")
+
+    async def terminate(self):
+        """插件停用时调用"""
+        logger.info("Markdown 转图片插件已停止")
 
     def _get_full_text_input(self, event: AstrMessageEvent, cmd_prefix: str = "") -> str:
         """手动提取文本，支持图文混排，防止被截断"""
@@ -128,6 +239,26 @@ class MarkdownConverterPlugin(Star):
         if cmd_prefix and full_text.startswith(cmd_prefix):
             full_text = full_text[len(cmd_prefix):].strip()
         return full_text
+
+    def _extract_markdown_robust(self, text: str) -> str:
+        """
+        强壮的 Markdown 提取逻辑：
+        1. 尝试匹配 <md>...</md>
+        2. 尝试匹配 <md>... (直到文本结束，处理 AI 忘写闭合标签的情况)
+        3. 如果都没找到，假定整段文本都是 Markdown (兜底策略)
+        """
+        # 模式：匹配 <md>...</md> 或 <md>...(到文本结束)
+        pattern = r"<md>(.*?)(?:</md>|$)"
+        match = re.search(pattern, text, re.DOTALL)
+        
+        if match:
+            content = match.group(1).strip()
+            if content:
+                return content
+        
+        # 兜底：如果没找到标签，直接返回原文本
+        logger.warning("未检测到 <md> 标签，将渲染全部文本。")
+        return text
 
     @filter.command("md")
     async def cmd_md(self, event: AstrMessageEvent):
@@ -149,41 +280,48 @@ class MarkdownConverterPlugin(Star):
 
         yield event.plain_result("✨ 正在生成 Markdown 渲染结果，请稍候...")
 
-        # 3. 构造系统提示词 (System Prompt)
-        # 关键点：不需要告诉它何时使用，而是强制它必须使用。
+        # 3. 构造系统提示词 (强约定版本)
         instruction_prompt = """
-【任务指令】
+【强制任务指令 - 必须严格遵守】
 用户希望你以 Markdown 格式回答问题，该回答将被直接渲染为图片。
-1. 请使用丰富的 Markdown 语法（LaTeX公式、代码块、表格、列表）来优化排版。
-2. 即使是纯文本回答，也请尽量分段使其美观。
-3. 【重要】为了确保渲染器识别，请务必将你的核心回答内容包裹在 <md> 和 </md> 标签中。
-   例如：
-   <md>
-   # 标题
-   这里是正文...
-   $$ E=mc^2 $$
-   </md>
+
+【格式要求 - 极其重要】
+1. 你必须使用丰富的 Markdown 语法（LaTeX公式、代码块、表格、列表）来优化排版。
+2. 【最重要】你必须将你的全部回答内容包裹在 <md> 开始标签和 </md> 结束标签之间。
+3. 【警告】不要忘记写结束标签 </md>！缺少结束标签会导致渲染失败！
+4. 标签外不要有任何内容，所有回答都必须在标签内。
+
+【正确格式示例】
+<md>
+# 标题
+
+这里是正文内容...
+
+## 代码示例
+```python
+print("Hello World")
+```
+
+## 数学公式
+$$ E = mc^2 $$
+
+</md>
+
+【错误示例 - 禁止这样做】
+❌ 忘记写 </md> 结束标签
+❌ 在 <md> 标签外写内容
+❌ 使用其他格式的标签
+
+现在请严格按照上述格式回答用户的问题。
 """
 
-        # 4. 手动构造请求并调用 LLM
-        # 这样可以只针对这一次请求注入 System Prompt，而不污染全局对话
+        # 4. 调用 LLM
         try:
-            # Step A: 将字符串 query 包装成 AstrBot 的消息对象
-            # 这是一个包含单个纯文本组件的消息链
-            message_obj = AstrMessage(chain=[Plain(query)])
-            
-            # Step B: 实例化 ProviderRequest
-            # 这里的参数名必须是 message_obj，不能是 text
-            req = ProviderRequest(
-                message_obj=message_obj,
-                session=event.session
+            # 直接调用 provider.text_chat，传入 prompt 和 system_prompt
+            response = await provider.text_chat(
+                prompt=query,
+                system_prompt=instruction_prompt
             )
-            
-            # Step C: 手动注入本次专用的系统提示词后缀
-            req.system_prompt_suffix = instruction_prompt
-
-            # 调用 LLM
-            response = await provider.text_chat(req)
             
             if not response or not response.completion_text:
                 yield event.plain_result("❌ LLM 未返回任何内容。")
@@ -191,7 +329,7 @@ class MarkdownConverterPlugin(Star):
                 
             raw_text = response.completion_text
 
-            # 5. 解析和容错处理 (核心改进点)
+            # 5. 提取 Markdown 内容（带容错）
             md_content = self._extract_markdown_robust(raw_text)
 
             # 6. 渲染图片
@@ -202,7 +340,7 @@ class MarkdownConverterPlugin(Star):
                 md_text=md_content,
                 output_image_path=output_path,
                 scale=2,
-                width=600 # 手机端阅读体验较好的宽度
+                width=600
             )
 
             # 7. 发送结果
@@ -213,32 +351,24 @@ class MarkdownConverterPlugin(Star):
 
         except Exception as e:
             logger.error(f"MD渲染插件异常: {e}")
-            import traceback
-            logger.error(traceback.format_exc()) # 打印详细堆栈以便排查
+            logger.error(traceback.format_exc())
             yield event.plain_result(f"❌ 处理请求时发生错误: {e}")
+    
 
-    def _extract_markdown_robust(self, text: str) -> str:
-        """
-        强壮的 Markdown 提取逻辑：
-        1. 尝试匹配 <md>...</md>
-        2. 尝试匹配 <md>... (直到文本结束，处理 AI 忘写闭合标签的情况)
-        3. 如果都没找到，假定整段文本都是 Markdown (兜底策略)
-        """
-        # 模式解释：
-        # <md>      : 匹配开始标签
-        # (.*?)     : 非贪婪匹配内容
-        # (?:</md>|$) : 匹配结束标签 OR 字符串末尾 ($)
-        # re.DOTALL : 让 . 可以匹配换行符
-        pattern = r"<md>(.*?)(?:</md>|$)"
-        match = re.search(pattern, text, re.DOTALL)
-        
-        if match:
-            content = match.group(1).strip()
-            # 如果标签内没内容（极少见），可能匹配错位，走兜底
-            if content:
-                return content
-        
-        # 兜底：如果没找到标签，或者标签是空的，直接返回原文本。
-        # 因为用户既然用了 /md 指令，就是希望渲染，与其报错不如直接渲染。
-        logger.warning("未检测到 <md> 标签，将渲染全部文本。")
-        return text
+if __name__ == "__main__":
+    # 生成一个固定宽度的图片
+    output_file_fixed_width = f"markdown_width_{uuid.uuid4().hex[:6]}.png"
+    asyncio.run(markdown_to_image_playwright(
+        markdown_string,
+        output_file_fixed_width,
+        scale=2,
+        width=1000  # 设置宽度为 600px
+    ))
+
+    # 生成一个自适应宽度的图片(不设置 width 参数)
+    output_file_auto_width = f"markdown_auto_{uuid.uuid4().hex[:6]}.png"
+    asyncio.run(markdown_to_image_playwright(
+        markdown_string,
+        output_file_auto_width,
+        scale=2
+    ))
