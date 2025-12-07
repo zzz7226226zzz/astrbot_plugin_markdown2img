@@ -243,8 +243,12 @@ class MarkdownConverterPlugin(Star):
         return full_text
 
     @filter.command("md")
-    async def cmd_md(self, event: AstrMessageEvent):
-        """/md 指令：调用 LLM，并将回答渲染为 Markdown 图片"""
+    async def cmd_md(self, event: AstrMessageEvent, *_):
+        """/md 指令：调用 LLM，并将回答渲染为 Markdown 图片
+
+        使用可变参数 *_ 以兼容 AstrBot 对命令处理函数的额外位置参数传入，
+        避免出现“takes 2 positional arguments but 3 were given”的错误。
+        """
 
         query = self._get_full_text_input(event, "/md")
         if not query:
