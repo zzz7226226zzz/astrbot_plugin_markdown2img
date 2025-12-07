@@ -2,6 +2,7 @@ import os
 import re
 import uuid
 import traceback
+import sys
 from typing import List
 
 from astrbot.api import logger
@@ -14,10 +15,6 @@ from astrbot.core.star.star_tools import StarTools
 import mistune
 import asyncio
 from playwright.async_api import async_playwright
-import uuid
-
-import subprocess
-import sys
 
 
 async def markdown_to_image_playwright(
@@ -165,64 +162,68 @@ class MarkdownConverterPlugin(Star):
         self.DATA_DIR = os.path.normpath(StarTools.get_data_dir())
         # 创建一个专门用于存放生成图片的缓存目录
         self.IMAGE_CACHE_DIR = os.path.join(self.DATA_DIR, "md2img_cache")
+        # Playwright 是否已就绪的标志
+        self._playwright_ready = False
+        self._playwright_installing = False
 
     async def initialize(self):
-        """初始化插件，确保图片缓存目录和 Playwright 浏览器存在 (异步版本)"""
+        """初始化插件，确保图片缓存目录存在，并在后台安装 Playwright"""
         try:
-            # os.makedirs is synchronous, but it's extremely fast and not a bottleneck.
-            # For a simple, one-off operation like this, it's fine to keep it.
             os.makedirs(self.IMAGE_CACHE_DIR, exist_ok=True)
-
-            logger.info("正在异步检查并安装 Playwright 浏览器依赖...")
-            
-            # This function starts a subprocess without blocking the event loop.
-
-            # Helper function to run a command and log its output
-            async def run_playwright_command(command: list, description: str):
-                process = await asyncio.create_subprocess_exec(
-                    *command,
-                    stdout=asyncio.subprocess.PIPE,
-                    stderr=asyncio.subprocess.PIPE
-                )
-
-                # Await the process to complete and capture the output
-                stdout, stderr = await process.communicate()
-
-                if process.returncode != 0:
-                    logger.error(
-                        f"自动安装 Playwright {description} 失败，返回码: {process.returncode}")
-                    if stderr:
-                        logger.error(
-                            f"错误输出: \n{stderr.decode('utf-8', errors='ignore')}")
-                    return False
-                else:
-                    output = stdout.decode('utf-8', errors='ignore')
-                    # Only log if there's meaningful output (e.g., not just "up to date")
-                    if "up to date" not in output:
-                        logger.info(
-                            f"Playwright {description} 安装/更新完成。\n{output}")
-                    else:
-                        logger.info(f"Playwright {description} 已是最新，无需下载。")
-                    return True
-
-            # Command to install chromium browser
-            install_browser_cmd = [sys.executable, "-m",
-                                   "playwright", "install", "chromium"]
-            await run_playwright_command(install_browser_cmd, "Chromium 浏览器")
-
-            # Command to install system dependencies
-            install_deps_cmd = [sys.executable,
-                                "-m", "playwright", "install-deps"]
-            await run_playwright_command(install_deps_cmd, "系统依赖")
-
             logger.info("Markdown 转图片插件已初始化")
-
-        except FileNotFoundError:
-            # This error happens if 'python -m playwright' cannot be run
-            logger.error(
-                "无法执行 Playwright 安装命令。请检查 Playwright Python 包是否已正确安装。")
+            logger.info(f"图片缓存目录: {self.IMAGE_CACHE_DIR}")
+            
+            # 在后台启动 Playwright 安装任务，不阻塞插件加载
+            asyncio.create_task(self._install_playwright_background())
+            
         except Exception as e:
-            logger.error(f"插件初始化过程中发生未知错误: {e}")
+            logger.error(f"插件初始化过程中发生错误: {e}")
+
+    async def _install_playwright_background(self):
+        """后台安装 Playwright 浏览器"""
+        if self._playwright_installing:
+            return
+        self._playwright_installing = True
+        
+        try:
+            logger.info("正在后台检查并安装 Playwright Chromium 浏览器...")
+            
+            # 安装 Chromium 浏览器
+            process = await asyncio.create_subprocess_exec(
+                sys.executable, "-m", "playwright", "install", "chromium",
+                stdout=asyncio.subprocess.PIPE,
+                stderr=asyncio.subprocess.PIPE
+            )
+            stdout, stderr = await process.communicate()
+            
+            if process.returncode == 0:
+                logger.info("Playwright Chromium 浏览器安装/检查完成")
+                self._playwright_ready = True
+            else:
+                error_msg = stderr.decode('utf-8', errors='ignore') if stderr else "未知错误"
+                logger.error(f"Playwright 安装失败: {error_msg}")
+                
+        except Exception as e:
+            logger.error(f"Playwright 后台安装异常: {e}")
+        finally:
+            self._playwright_installing = False
+
+    async def _ensure_playwright_ready(self) -> bool:
+        """确保 Playwright 已就绪，如果未就绪则等待安装完成"""
+        if self._playwright_ready:
+            return True
+            
+        # 如果正在安装，等待安装完成（最多等待 120 秒）
+        if self._playwright_installing:
+            for _ in range(120):
+                await asyncio.sleep(1)
+                if self._playwright_ready:
+                    return True
+            return False
+        
+        # 如果既没就绪也没在安装，尝试安装
+        await self._install_playwright_background()
+        return self._playwright_ready
 
     async def terminate(self):
         """插件停用时调用"""
@@ -261,7 +262,7 @@ class MarkdownConverterPlugin(Star):
         return text
 
     @filter.command("md")
-    async def cmd_md(self, event: AstrMessageEvent):
+    async def cmd_md(self, event: AstrMessageEvent, ctx: Context = None):
         """
         指令: /md <内容>
         说明: 让 LLM 回答并强制渲染为 Markdown 图片
@@ -332,7 +333,12 @@ $$ E = mc^2 $$
             # 5. 提取 Markdown 内容（带容错）
             md_content = self._extract_markdown_robust(raw_text)
 
-            # 6. 渲染图片
+            # 6. 确保 Playwright 已就绪
+            if not await self._ensure_playwright_ready():
+                yield event.plain_result("❌ Playwright 浏览器尚未安装完成，请稍后重试。")
+                return
+
+            # 7. 渲染图片
             image_filename = f"{uuid.uuid4()}.png"
             output_path = os.path.join(self.IMAGE_CACHE_DIR, image_filename)
             
@@ -343,7 +349,7 @@ $$ E = mc^2 $$
                 width=600
             )
 
-            # 7. 发送结果
+            # 8. 发送结果
             if os.path.exists(output_path):
                 yield event.image_result(output_path)
             else:
