@@ -10,6 +10,7 @@ from astrbot.api.star import Context, Star, register
 from astrbot.core.message.components import Image, Plain
 from astrbot.core.provider.entities import LLMResponse, ProviderRequest
 from astrbot.core.star.star_tools import StarTools
+from astrbot.core.star.filter.command import GreedyStr
 
 # 确保你已经安装了 mistune 和 playwright
 import mistune
@@ -166,8 +167,6 @@ class MarkdownConverterPlugin(Star):
         self.DATA_DIR = os.path.normpath(StarTools.get_data_dir())
         # 创建一个专门用于存放生成图片的缓存目录
         self.IMAGE_CACHE_DIR = os.path.join(self.DATA_DIR, "md2img_cache")
-        # 用于存储已启用 md2img 功能的会话 ID
-        self._enabled_sessions = set()
 
     async def initialize(self):
         """初始化插件，确保图片缓存目录和 Playwright 浏览器存在 (异步版本)"""
@@ -231,41 +230,42 @@ class MarkdownConverterPlugin(Star):
         """插件停用时调用"""
         logger.info("Markdown 转图片插件已停止")
 
-    def _get_session_id(self, event: AstrMessageEvent) -> str:
-        """获取会话的唯一标识符"""
-        return event.unified_msg_origin
-
     @filter.command("md")
-    async def cmd_md(self, event: AstrMessageEvent):
-        """处理 /md 指令，启用或禁用当前会话的 markdown 转图片功能"""
-        session_id = self._get_session_id(event)
+    async def cmd_md(self, event: AstrMessageEvent, content: GreedyStr = ""):
+        """处理 /md 指令，将后续内容发送给 LLM 并将回复转换为图片
         
-        if session_id in self._enabled_sessions:
-            self._enabled_sessions.discard(session_id)
-            yield event.plain_result("✅ Markdown 转图片功能已关闭")
-        else:
-            self._enabled_sessions.add(session_id)
-            yield event.plain_result("✅ Markdown 转图片功能已开启\n\nLLM 将在需要时自动使用图片渲染复杂的 Markdown 内容。\n再次发送 /md 可关闭此功能。")
+        用法：/md <你的问题>
+        示例：/md 请用Python写一个快速排序算法
+        """
+        # 标记该事件需要进行 md2img 处理
+        event.set_extra("md2img_enabled", True)
+        
+        if not content or not content.strip():
+            yield event.plain_result("请在 /md 后面输入你的问题\n\n用法：/md <你的问题>\n示例：/md 请用Python写一个快速排序算法")
+            return
+        
+        # 将用户的问题发送给 LLM
+        yield event.request_llm(
+            prompt=content,
+            func_tool_manager=self.context.get_llm_tool_manager(),
+        )
 
     @filter.on_llm_request()
     async def on_llm_req(self, event: AstrMessageEvent, req: ProviderRequest):
-        """向 LLM 注入使用 Markdown 转图片功能的指令（仅在启用时）"""
-        session_id = self._get_session_id(event)
-        
-        # 只有在会话启用了 md2img 功能时才注入 prompt
-        if session_id not in self._enabled_sessions:
+        """向 LLM 注入使用 Markdown 转图片功能的指令（仅在 /md 指令触发时）"""
+        # 只有在 /md 指令触发时才注入 prompt
+        if not event.get_extra("md2img_enabled"):
             return
         
         instruction_prompt = """
-当你需要发送包含复杂格式（如代码块、表格、嵌套列表等）的内容时，为了获得更好的显示效果，你可以将这部分内容渲染成一张图片。
+请使用 Markdown 格式回复，回复内容将被渲染为图片。
 
 【重要】使用规则：
-1. 将你需要转换为图片的 Markdown 全文内容包裹在 `<md>` 和 `</md>` 标签之间。
-2. **必须严格确保标签闭合**：每个 `<md>` 标签必须有且仅有一个对应的 `</md>` 标签。
-3. **标签必须独占一行**：`<md>` 和 `</md>` 标签应各自单独占据一行，不要与其他内容混在同一行。
+1. 将你的完整回复内容包裹在 `<md>` 和 `</md>` 标签之间。
+2. **必须严格确保标签闭合**：必须有且仅有一对 `<md>` 和 `</md>` 标签。
+3. **标签必须独占一行**：`<md>` 和 `</md>` 标签应各自单独占据一行。
 4. **标签内不能嵌套**：`<md>` 标签内部不能再包含 `<md>` 或 `</md>` 标签。
 5. 标签内的内容应为完整的、格式正确的 Markdown 文本。
-6. 请自行判断何时使用该功能，通常用于格式复杂、纯文本难以阅读的场景。
 
 正确示例：
 <md>
@@ -281,34 +281,25 @@ def hello_world():
     print("Hello, World!")
 ```
 </md>
-
-错误示例（不要这样做）：
-- 标签不闭合：`<md> 内容没有结束标签`
-- 标签嵌套：`<md> <md> 内容 </md> </md>`
-- 标签不独占一行：`一些文字<md>内容</md>其他文字`
 """
         # 将指令添加到 system prompt 的末尾
         req.system_prompt += f"\n\n{instruction_prompt}"
 
     @filter.on_llm_response()
     async def on_llm_resp(self, event: AstrMessageEvent, resp: LLMResponse):
-        """将原始响应暂存，以便后续处理（仅在启用时）"""
-        session_id = self._get_session_id(event)
-        
-        # 只有在会话启用了 md2img 功能时才保存
-        if session_id not in self._enabled_sessions:
+        """将原始响应暂存（仅在 /md 指令触发时）"""
+        # 只有在 /md 指令触发时才处理
+        if not event.get_extra("md2img_enabled"):
             return
             
-        # 这一步是为了将 LLM 的原始响应（可能包含<md>标签）保存到事件上下文中
+        # 保存 LLM 的原始响应
         event.set_extra("raw_llm_completion_text", resp.completion_text)
 
     @filter.on_decorating_result()
     async def on_decorating_result(self, event: AstrMessageEvent):
-        """在最终消息链生成阶段，解析并替换 <md> 标签（仅在启用时）"""
-        session_id = self._get_session_id(event)
-        
-        # 只有在会话启用了 md2img 功能时才处理
-        if session_id not in self._enabled_sessions:
+        """在最终消息链生成阶段，解析并替换 <md> 标签（仅在 /md 指令触发时）"""
+        # 只有在 /md 指令触发时才处理
+        if not event.get_extra("md2img_enabled"):
             return
             
         result = event.get_result()
