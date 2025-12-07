@@ -12,6 +12,13 @@ from playwright.async_api import async_playwright
 from astrbot.api import logger
 from astrbot.api.event import filter, AstrMessageEvent
 from astrbot.api.star import Context, Star, register
+try:
+    from astrbot.core.message.message import AstrMessage  # <--- 新增这行
+except Exception:
+    # 回退实现：在没有 astrbot 包的开发/静态检查环境中使用一个轻量级替代品
+    class AstrMessage:
+        def __init__(self, chain=None):
+            self.chain = chain or []
 from astrbot.core.message.components import Image, Plain
 from astrbot.core.provider.entities import ProviderRequest
 from astrbot.core.star.star_tools import StarTools
@@ -161,12 +168,20 @@ class MarkdownConverterPlugin(Star):
         # 4. 手动构造请求并调用 LLM
         # 这样可以只针对这一次请求注入 System Prompt，而不污染全局对话
         try:
+            # Step A: 将字符串 query 包装成 AstrBot 的消息对象
+            # 这是一个包含单个纯文本组件的消息链
+            message_obj = AstrMessage(chain=[Plain(query)])
+            
+            # Step B: 实例化 ProviderRequest
+            # 这里的参数名必须是 message_obj，不能是 text
             req = ProviderRequest(
-                text=query,
-                session=event.session, # 传入 session 以保留上下文记忆
-                system_prompt_suffix=instruction_prompt # 仅本次追加提示词
+                message_obj=message_obj,
+                session=event.session
             )
             
+            # Step C: 手动注入本次专用的系统提示词后缀
+            req.system_prompt_suffix = instruction_prompt
+
             # 调用 LLM
             response = await provider.text_chat(req)
             
@@ -198,6 +213,8 @@ class MarkdownConverterPlugin(Star):
 
         except Exception as e:
             logger.error(f"MD渲染插件异常: {e}")
+            import traceback
+            logger.error(traceback.format_exc()) # 打印详细堆栈以便排查
             yield event.plain_result(f"❌ 处理请求时发生错误: {e}")
 
     def _extract_markdown_robust(self, text: str) -> str:
