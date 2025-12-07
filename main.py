@@ -217,9 +217,9 @@ $$
 
         try:
             req = ProviderRequest(
-                text=query,
-                session=event.session,
-                system_prompt_suffix=instruction_prompt,
+                prompt=query,
+                session_id=event.session_id,
+                system_prompt=instruction_prompt,
             )
 
             resp: LLMResponse = await provider.text_chat(req)
