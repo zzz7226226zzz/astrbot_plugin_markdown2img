@@ -289,11 +289,12 @@ class MarkdownConverterPlugin(Star):
 当你需要发送包含复杂格式（如代码块、表格、嵌套列表等）的内容时，为了获得更好的显示效果，你可以将这部分内容渲染成Markdown。
 
 使用规则：
-1. 用户必须在消息中明确指出需要转换为图片的 Markdown 内容。
-2. LLM应自行判断何时使用该功能，通常用于格式复杂、纯文本难以阅读的场景。
+1. 将你需要转换为图片的 Markdown 全文内容包裹在 `<md>` 和 `</md>` 标签之间。
+2. LLM 应自行判断何时使用该功能，通常用于格式复杂、纯文本难以阅读的场景。
 3. 标签内的内容应为完整的、格式正确的 Markdown 文本。
-4. **标签必须独占一行**：`<md>` 和 `</md>` 标签应各自单独占据一行。
-5. **标签内不能嵌套**：`<md>` 标签内部不能再包含 `<md>` 或 `</md>` 标签。
+4. **必须严格确保标签闭合**：必须有且仅有一对 `<md>` 和 `</md>` 标签。
+5. **标签必须独占一行**：`<md>` 和 `</md>` 标签应各自单独占据一行。
+6. **标签内不能嵌套**：`<md>` 标签内部不能再包含 `<md>` 或 `</md>` 标签。
 
 正确示例：
 <md>
@@ -402,10 +403,10 @@ def hello_world():
             logger.warning("检测到嵌套的 <md> 标签，将原样输出文本。")
             cleaned_text = self._clean_unclosed_md_tags(text)
             return [Plain(cleaned_text)]
-        
-        # 使用更严格的正则表达式来匹配完整闭合的标签
-        # 确保 <md> 和 </md> 是完整的标签
-        pattern = r"(<md>.*?</md>)"
+
+        # 使用更健壮的正则表达式来匹配完整闭合的标签
+        # 兼容标签独占一行的情况（例如 '<md>\n...\n</md>'）
+        pattern = r"(<md>\s*.*?\s*</md>)"
         parts = re.split(pattern, text, flags=re.DOTALL)
 
         for part in parts:
@@ -414,9 +415,11 @@ def hello_world():
                 continue
 
             # 检查当前部分是否是 <md> 标签
-            if part.startswith("<md>") and part.endswith("</md>"):
+            if re.match(r"^<md>\s*", part) and re.search(r"\s*</md>$", part):
                 # 提取标签内的 Markdown 内容
-                md_content = part[4:-5].strip()
+                md_content = re.sub(r"^<md>\s*", "", part)
+                md_content = re.sub(r"\s*</md>$", "", md_content)
+                md_content = md_content.strip()
                 if not md_content:
                     continue
 
