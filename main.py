@@ -1,49 +1,21 @@
 import os
 import re
+import sys
 import uuid
 from typing import List
 
+import asyncio
+import mistune
+from playwright.async_api import async_playwright
 
 from astrbot.api import logger
-from astrbot.api.event import filter, AstrMessageEvent
+from astrbot.api.event import AstrMessageEvent, filter
 from astrbot.api.star import Context, Star, register
+from astrbot.core.agent.message import AssistantMessageSegment, UserMessageSegment
 from astrbot.core.message.components import Image, Plain
 from astrbot.core.provider.entities import LLMResponse, ProviderRequest
-from astrbot.core.star.star_tools import StarTools
 from astrbot.core.star.filter.command import GreedyStr
-
-# 确保你已经安装了 mistune 和 playwright
-import mistune
-import asyncio
-from playwright.async_api import async_playwright
-import uuid
-
-import subprocess
-import sys
-
-
-def _is_md_message(event: AstrMessageEvent) -> bool:
-    """判断当前事件是否为 /md 指令触发的消息（只对这一条消息生效）。"""
-    try:
-        msg = (event.get_message_str() or "").strip()
-    except Exception:
-        return False
-
-    # AstrBot 的 command filter 会做标准化空白，这里也做一次，提升兼容性
-    msg = re.sub(r"\s+", " ", msg)
-    return msg == "/md" or msg.startswith("/md ")
-
-
-def _strip_md_prefix(message: str) -> str:
-    """去掉 /md 前缀（仅处理本插件关心的 /md 入口）。"""
-    if not message:
-        return ""
-    msg = re.sub(r"\s+", " ", message).strip()
-    if msg == "/md":
-        return ""
-    if msg.startswith("/md "):
-        return msg[len("/md ") :].strip()
-    return message.strip()
+from astrbot.core.star.star_tools import StarTools
 
 
 async def markdown_to_image_playwright(
@@ -155,30 +127,6 @@ async def markdown_to_image_playwright(
         print(f"图片已保存到: {output_image_path}")
 
 
-# --- 示例 ---
-markdown_string = """
-# Playwright 渲染测试
-
-这是一个宽度被设置为 600px 的示例。当文本内容足够长时，它会自动换行以适应设定的宽度。
-
-行内公式 $a^2 + b^2 = c^2$。
-
-独立公式：
-$$
-\\int_0^\\infty e^{-x^2} dx = \\frac{\\sqrt{\pi}}{2}
-$$
-
-以及一段 C++ 代码:
-```cpp
-#include <iostream>
-
-int main() {
-    // 这是一段注释，用来增加代码块的宽度，以测试在固定宽度下的显示效果。
-    std::cout << "Hello, C++! This is a longer line to demonstrate wrapping or scrolling." << std::endl;
-    return 0;
-}
-"""
-
 @register(
     "astrbot_plugin_md2img",
     "tosaki",  # Or your name
@@ -254,43 +202,86 @@ class MarkdownConverterPlugin(Star):
         """插件停用时调用"""
         logger.info("Markdown 转图片插件已停止")
 
+    async def _ensure_conversation_id(self, event: AstrMessageEvent) -> str | None:
+        """获取当前会话对应的 conversation_id（不存在则创建）。"""
+        umo = getattr(event, "unified_msg_origin", None)
+        if not umo:
+            return None
+
+        cid = await self.context.conversation_manager.get_curr_conversation_id(umo)
+        if cid:
+            return cid
+
+        # 从参考核心代码看，platform_id 可从 umo 的第 0 段拿到
+        platform_id = None
+        try:
+            platform_id = umo.split(":", 1)[0]
+        except Exception:
+            platform_id = None
+
+        return await self.context.conversation_manager.new_conversation(
+            unified_msg_origin=umo,
+            platform_id=platform_id,
+        )
+
+    async def _append_user_assistant_to_conversation(
+        self,
+        *,
+        event: AstrMessageEvent,
+        user_text: str,
+        assistant_text: str,
+    ) -> None:
+        """方案B：手动把 user/assistant 写入当前会话的 conversation。"""
+        cid = await self._ensure_conversation_id(event)
+        if not cid:
+            return
+
+        await self.context.conversation_manager.add_message_pair(
+            cid=cid,
+            user_message=UserMessageSegment(content=user_text),
+            assistant_message=AssistantMessageSegment(content=assistant_text),
+        )
+
     @filter.command("md")
     async def cmd_md(self, event: AstrMessageEvent, content: GreedyStr = ""):
-        """处理 /md 指令。
-
-        这个 handler 只做参数校验/提示，不再手动 request_llm，
-        这样可以确保用户输入与模型输出会被默认流程写入 conversation。
+        """处理 /md 指令，将后续内容发送给 LLM 并将回复转换为图片
+        
+        用法：/md <你的问题>
+        示例：/md 请用Python写一个快速排序算法
         """
-        if not content or not content.strip():
+        # 标记该事件需要进行 md2img 处理
+        event.set_extra("md2img_enabled", True)
+
+        content = (content or "").strip()
+        if not content:
             yield event.plain_result(
                 "请在 /md 后面输入你的问题\n\n用法：/md <你的问题>\n示例：/md 请用Python写一个快速排序算法",
             )
             return
 
-        # 不返回任何 ProviderRequest / Result，让默认流程继续执行。
-        return
+        # 记录本次 user 输入（去掉 /md 前缀后即 content）
+        # 先暂存，等拿到 LLM 输出后再成对写入，避免半截历史。
+        event.set_extra("md2img_user_input", content)
+
+        # 将用户的问题发送给 LLM
+        yield event.request_llm(
+            prompt=content,
+            func_tool_manager=self.context.get_llm_tool_manager(),
+        )
 
     @filter.on_llm_request()
     async def on_llm_req(self, event: AstrMessageEvent, req: ProviderRequest):
         """向 LLM 注入使用 Markdown 转图片功能的指令（仅在 /md 指令触发时）"""
-        if not _is_md_message(event):
+        # 只有在 /md 指令触发时才注入 prompt
+        if not event.get_extra("md2img_enabled"):
             return
-
-        # 方案A：走默认链路时，用户输入会进入 conversation。
-        # 为了避免把 “/md ” 前缀也扔给 LLM，这里直接改写 prompt。
-        # ProviderRequest 在默认链路中会被后续 stage 使用。
-        try:
-            req.prompt = _strip_md_prefix(req.prompt)
-        except Exception:
-            # 兼容不同 ProviderRequest 实现
-            pass
         
         instruction_prompt = """
-当你需要发送包含复杂格式（如代码块、表格、嵌套列表等）的内容时，为了获得更好的显示效果，你可以将这部分内容渲染成Markdown。
+当你需要发送包含复杂格式（如代码块、表格、嵌套列表等）的内容时，为了获得更好的显示效果，你可以将这部分内容渲染成一张图片。
 
 使用规则：
 1. 将你需要转换为图片的 Markdown 全文内容包裹在 `<md>` 和 `</md>` 标签之间。
-2. LLM 应自行判断何时使用该功能，通常用于格式复杂、纯文本难以阅读的场景。
+2. LLM应自行判断何时使用该功能，通常用于格式复杂、纯文本难以阅读的场景。
 3. 标签内的内容应为完整的、格式正确的 Markdown 文本。
 4. **必须严格确保标签闭合**：必须有且仅有一对 `<md>` 和 `</md>` 标签。
 5. **标签必须独占一行**：`<md>` 和 `</md>` 标签应各自单独占据一行。
@@ -317,16 +308,31 @@ def hello_world():
     @filter.on_llm_response()
     async def on_llm_resp(self, event: AstrMessageEvent, resp: LLMResponse):
         """将原始响应暂存（仅在 /md 指令触发时）"""
-        if not _is_md_message(event):
+        # 只有在 /md 指令触发时才处理
+        if not event.get_extra("md2img_enabled"):
             return
             
         # 保存 LLM 的原始响应
         event.set_extra("raw_llm_completion_text", resp.completion_text)
 
+        # 方案B：把 /md 的 user 输入（已去前缀）以及 LLM 输出写入 conversation
+        user_text = (event.get_extra("md2img_user_input") or "").strip()
+        assistant_text = (resp.completion_text or "").strip()
+        if user_text and assistant_text:
+            try:
+                await self._append_user_assistant_to_conversation(
+                    event=event,
+                    user_text=user_text,
+                    assistant_text=assistant_text,
+                )
+            except Exception as e:
+                logger.error(f"写入 conversation 失败: {e}")
+
     @filter.on_decorating_result()
     async def on_decorating_result(self, event: AstrMessageEvent):
         """在最终消息链生成阶段，解析并替换 <md> 标签（仅在 /md 指令触发时）"""
-        if not _is_md_message(event):
+        # 只有在 /md 指令触发时才处理
+        if not event.get_extra("md2img_enabled"):
             return
             
         result = event.get_result()
@@ -403,10 +409,10 @@ def hello_world():
             logger.warning("检测到嵌套的 <md> 标签，将原样输出文本。")
             cleaned_text = self._clean_unclosed_md_tags(text)
             return [Plain(cleaned_text)]
-
-        # 使用更健壮的正则表达式来匹配完整闭合的标签
-        # 兼容标签独占一行的情况（例如 '<md>\n...\n</md>'）
-        pattern = r"(<md>\s*.*?\s*</md>)"
+        
+        # 使用更严格的正则表达式来匹配完整闭合的标签
+        # 确保 <md> 和 </md> 是完整的标签
+        pattern = r"(<md>.*?</md>)"
         parts = re.split(pattern, text, flags=re.DOTALL)
 
         for part in parts:
@@ -415,11 +421,9 @@ def hello_world():
                 continue
 
             # 检查当前部分是否是 <md> 标签
-            if re.match(r"^<md>\s*", part) and re.search(r"\s*</md>$", part):
+            if part.startswith("<md>") and part.endswith("</md>"):
                 # 提取标签内的 Markdown 内容
-                md_content = re.sub(r"^<md>\s*", "", part)
-                md_content = re.sub(r"\s*</md>$", "", md_content)
-                md_content = md_content.strip()
+                md_content = part[4:-5].strip()
                 if not md_content:
                     continue
 
@@ -452,22 +456,4 @@ def hello_world():
                 components.append(Plain(part))
 
         return components
-    
 
-if __name__ == "__main__":
-    # 生成一个固定宽度的图片
-    output_file_fixed_width = f"markdown_width_{uuid.uuid4().hex[:6]}.png"
-    asyncio.run(markdown_to_image_playwright(
-        markdown_string,
-        output_file_fixed_width,
-        scale=2,
-        width=1000  # 设置宽度为 600px
-    ))
-
-    # 生成一个自适应宽度的图片(不设置 width 参数)
-    output_file_auto_width = f"markdown_auto_{uuid.uuid4().hex[:6]}.png"
-    asyncio.run(markdown_to_image_playwright(
-        markdown_string,
-        output_file_auto_width,
-        scale=2
-    ))
