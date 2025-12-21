@@ -22,6 +22,30 @@ import subprocess
 import sys
 
 
+def _is_md_message(event: AstrMessageEvent) -> bool:
+    """判断当前事件是否为 /md 指令触发的消息（只对这一条消息生效）。"""
+    try:
+        msg = (event.get_message_str() or "").strip()
+    except Exception:
+        return False
+
+    # AstrBot 的 command filter 会做标准化空白，这里也做一次，提升兼容性
+    msg = re.sub(r"\s+", " ", msg)
+    return msg == "/md" or msg.startswith("/md ")
+
+
+def _strip_md_prefix(message: str) -> str:
+    """去掉 /md 前缀（仅处理本插件关心的 /md 入口）。"""
+    if not message:
+        return ""
+    msg = re.sub(r"\s+", " ", message).strip()
+    if msg == "/md":
+        return ""
+    if msg.startswith("/md "):
+        return msg[len("/md ") :].strip()
+    return message.strip()
+
+
 async def markdown_to_image_playwright(
     md_text: str,
     output_image_path: str,
@@ -232,41 +256,44 @@ class MarkdownConverterPlugin(Star):
 
     @filter.command("md")
     async def cmd_md(self, event: AstrMessageEvent, content: GreedyStr = ""):
-        """处理 /md 指令，将后续内容发送给 LLM 并将回复转换为图片
-        
-        用法：/md <你的问题>
-        示例：/md 请用Python写一个快速排序算法
+        """处理 /md 指令。
+
+        这个 handler 只做参数校验/提示，不再手动 request_llm，
+        这样可以确保用户输入与模型输出会被默认流程写入 conversation。
         """
-        # 标记该事件需要进行 md2img 处理
-        event.set_extra("md2img_enabled", True)
-        
         if not content or not content.strip():
-            yield event.plain_result("请在 /md 后面输入你的问题\n\n用法：/md <你的问题>\n示例：/md 请用Python写一个快速排序算法")
+            yield event.plain_result(
+                "请在 /md 后面输入你的问题\n\n用法：/md <你的问题>\n示例：/md 请用Python写一个快速排序算法",
+            )
             return
-        
-        # 将用户的问题发送给 LLM
-        yield event.request_llm(
-            prompt=content,
-            func_tool_manager=self.context.get_llm_tool_manager(),
-        )
+
+        # 不返回任何 ProviderRequest / Result，让默认流程继续执行。
+        return
 
     @filter.on_llm_request()
     async def on_llm_req(self, event: AstrMessageEvent, req: ProviderRequest):
         """向 LLM 注入使用 Markdown 转图片功能的指令（仅在 /md 指令触发时）"""
-        # 只有在 /md 指令触发时才注入 prompt
-        if not event.get_extra("md2img_enabled"):
+        if not _is_md_message(event):
             return
+
+        # 方案A：走默认链路时，用户输入会进入 conversation。
+        # 为了避免把 “/md ” 前缀也扔给 LLM，这里直接改写 prompt。
+        # ProviderRequest 在默认链路中会被后续 stage 使用。
+        try:
+            req.prompt = _strip_md_prefix(req.prompt)
+        except Exception:
+            # 兼容不同 ProviderRequest 实现
+            pass
         
         instruction_prompt = """
-当你需要发送包含复杂格式（如代码块、表格、嵌套列表等）的内容时，为了获得更好的显示效果，你可以将这部分内容渲染成一张图片。
+当你需要发送包含复杂格式（如代码块、表格、嵌套列表等）的内容时，为了获得更好的显示效果，你可以将这部分内容渲染成Markdown。
 
 使用规则：
-1. 将你需要转换为图片的 Markdown 全文内容包裹在 `<md>` 和 `</md>` 标签之间。
+1. 用户必须在消息中明确指出需要转换为图片的 Markdown 内容。
 2. LLM应自行判断何时使用该功能，通常用于格式复杂、纯文本难以阅读的场景。
 3. 标签内的内容应为完整的、格式正确的 Markdown 文本。
-4. **必须严格确保标签闭合**：必须有且仅有一对 `<md>` 和 `</md>` 标签。
-5. **标签必须独占一行**：`<md>` 和 `</md>` 标签应各自单独占据一行。
-6. **标签内不能嵌套**：`<md>` 标签内部不能再包含 `<md>` 或 `</md>` 标签。
+4. **标签必须独占一行**：`<md>` 和 `</md>` 标签应各自单独占据一行。
+5. **标签内不能嵌套**：`<md>` 标签内部不能再包含 `<md>` 或 `</md>` 标签。
 
 正确示例：
 <md>
@@ -289,8 +316,7 @@ def hello_world():
     @filter.on_llm_response()
     async def on_llm_resp(self, event: AstrMessageEvent, resp: LLMResponse):
         """将原始响应暂存（仅在 /md 指令触发时）"""
-        # 只有在 /md 指令触发时才处理
-        if not event.get_extra("md2img_enabled"):
+        if not _is_md_message(event):
             return
             
         # 保存 LLM 的原始响应
@@ -299,8 +325,7 @@ def hello_world():
     @filter.on_decorating_result()
     async def on_decorating_result(self, event: AstrMessageEvent):
         """在最终消息链生成阶段，解析并替换 <md> 标签（仅在 /md 指令触发时）"""
-        # 只有在 /md 指令触发时才处理
-        if not event.get_extra("md2img_enabled"):
+        if not _is_md_message(event):
             return
             
         result = event.get_result()
