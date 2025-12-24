@@ -315,19 +315,6 @@ def hello_world():
         # 保存 LLM 的原始响应
         event.set_extra("raw_llm_completion_text", resp.completion_text)
 
-        # 方案B：把 /md 的 user 输入（已去前缀）以及 LLM 输出写入 conversation
-        user_text = (event.get_extra("md2img_user_input") or "").strip()
-        assistant_text = (resp.completion_text or "").strip()
-        if user_text and assistant_text:
-            try:
-                await self._append_user_assistant_to_conversation(
-                    event=event,
-                    user_text=user_text,
-                    assistant_text=assistant_text,
-                )
-            except Exception as e:
-                logger.error(f"写入 conversation 失败: {e}")
-
     @filter.on_decorating_result()
     async def on_decorating_result(self, event: AstrMessageEvent):
         """在最终消息链生成阶段，解析并替换 <md> 标签（仅在 /md 指令触发时）"""
@@ -342,15 +329,46 @@ def hello_world():
             
         chain = result.chain
         new_chain = []
+        # 收集用于 conversation 写入的最终文本，确保图片已替换
+        conversation_text_parts = []
         for item in chain:
             # 我们只处理纯文本部分
             if isinstance(item, Plain):
                 # 调用核心处理函数
                 components = await self._process_text_with_markdown(item.text)
                 new_chain.extend(components)
+                conversation_text_parts.append(self._components_to_plaintext(components))
             else:
                 new_chain.append(item)
+                conversation_text_parts.append(self._components_to_plaintext([item]))
         result.chain = new_chain
+
+        # 在 Markdown 替换为图片后再写入 conversation
+        if not event.get_extra("md2img_conversation_logged"):
+            user_text = (event.get_extra("md2img_user_input") or "").strip()
+            assistant_text = "".join(conversation_text_parts).strip()
+            if user_text and assistant_text:
+                try:
+                    await self._append_user_assistant_to_conversation(
+                        event=event,
+                        user_text=user_text,
+                        assistant_text=assistant_text,
+                    )
+                    event.set_extra("md2img_conversation_logged", True)
+                except Exception as e:
+                    logger.error(f"写入 conversation 失败: {e}")
+
+    def _components_to_plaintext(self, components: List) -> str:
+        """将最终组件序列转为可写入会话的文本。"""
+        parts = []
+        for comp in components:
+            if isinstance(comp, Plain):
+                parts.append(comp.text)
+            elif isinstance(comp, Image):
+                parts.append("[MD图片]")
+            else:
+                parts.append(str(comp))
+        return "".join(parts)
 
     def _clean_unclosed_md_tags(self, text: str) -> str:
         """
