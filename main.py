@@ -301,8 +301,12 @@ def hello_world():
 ```
 </md>
 """
-        # 追加而非覆盖，确保保留 AstrBot 原有人设/系统提示
-        req.user_prompt = f"{instruction_prompt}\n\n{req.user_prompt}"
+        # 确保不覆盖人设：若已有 system prompt 则追加；否则只放入用户侧以免误当人设覆盖
+        instruction_prompt = instruction_prompt.strip()
+        if req.system_prompt:
+            req.system_prompt = f"{req.system_prompt}\n\n{instruction_prompt}"
+        # 把指令前置到 user prompt，避免其他插件重写 system prompt 时丢失 md 说明
+        req.user_prompt = f"{instruction_prompt}\n\n{(req.user_prompt or '').strip()}".strip()
 
     @filter.on_llm_response()
     async def on_llm_resp(self, event: AstrMessageEvent, resp: LLMResponse):
