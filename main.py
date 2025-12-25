@@ -259,7 +259,7 @@ class MarkdownConverterPlugin(Star):
             )
             return
 
-        # 记录原始用户输入（保留 /md 前缀），方便会话还原真实提问
+        # 记录原始用户输入（保留 /md 前缀，方便还原真实提问）
         event.set_extra("md2img_user_input", f"/md {content}".strip())
 
         # 将用户的问题发送给 LLM
@@ -301,9 +301,13 @@ def hello_world():
 ```
 </md>
 """
-        # 仅在 /md 触发时附加指令，保持系统人设不被覆盖，将说明前置到 user prompt
+        # 参考 t0saki 插件的注入方式：优先追加在已有 system prompt，避免覆盖人设；
+        # 如果 system prompt 为空，则前置到 user prompt，保证 md 指令仍可生效。
         instruction_prompt = instruction_prompt.strip()
-        req.user_prompt = f"{instruction_prompt}\n\n{(req.user_prompt or '').strip()}".strip()
+        if req.system_prompt:
+            req.system_prompt = f"{req.system_prompt}\n\n{instruction_prompt}"
+        else:
+            req.user_prompt = f"{instruction_prompt}\n\n{(req.user_prompt or '').strip()}".strip()
 
     @filter.on_llm_response()
     async def on_llm_resp(self, event: AstrMessageEvent, resp: LLMResponse):
