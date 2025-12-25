@@ -1,21 +1,26 @@
 import os
 import re
-import sys
 import uuid
+import json
 from typing import List
 
-import asyncio
-import mistune
-from playwright.async_api import async_playwright
 
 from astrbot.api import logger
-from astrbot.api.event import AstrMessageEvent, filter
+from astrbot.api.event import filter, AstrMessageEvent
 from astrbot.api.star import Context, Star, register
-from astrbot.core.agent.message import AssistantMessageSegment, UserMessageSegment
 from astrbot.core.message.components import Image, Plain
 from astrbot.core.provider.entities import LLMResponse, ProviderRequest
 from astrbot.core.star.filter.command import GreedyStr
 from astrbot.core.star.star_tools import StarTools
+
+# 确保你已经安装了 mistune 和 playwright
+import mistune
+import asyncio
+from playwright.async_api import async_playwright
+import uuid
+
+import subprocess
+import sys
 
 
 async def markdown_to_image_playwright(
@@ -127,6 +132,30 @@ async def markdown_to_image_playwright(
         print(f"图片已保存到: {output_image_path}")
 
 
+# --- 示例 ---
+markdown_string = """
+# Playwright 渲染测试
+
+这是一个宽度被设置为 600px 的示例。当文本内容足够长时，它会自动换行以适应设定的宽度。
+
+行内公式 $a^2 + b^2 = c^2$。
+
+独立公式：
+$$
+\\int_0^\\infty e^{-x^2} dx = \\frac{\\sqrt{\pi}}{2}
+$$
+
+以及一段 C++ 代码:
+```cpp
+#include <iostream>
+
+int main() {
+    // 这是一段注释，用来增加代码块的宽度，以测试在固定宽度下的显示效果。
+    std::cout << "Hello, C++! This is a longer line to demonstrate wrapping or scrolling." << std::endl;
+    return 0;
+}
+"""
+
 @register(
     "astrbot_plugin_md2img",
     "tosaki",  # Or your name
@@ -202,91 +231,70 @@ class MarkdownConverterPlugin(Star):
         """插件停用时调用"""
         logger.info("Markdown 转图片插件已停止")
 
-    async def _ensure_conversation_id(self, event: AstrMessageEvent) -> str | None:
-        """获取当前会话对应的 conversation_id（不存在则创建）。"""
-        umo = getattr(event, "unified_msg_origin", None)
-        if not umo:
-            return None
-
-        cid = await self.context.conversation_manager.get_curr_conversation_id(umo)
-        if cid:
-            return cid
-
-        # 从参考核心代码看，platform_id 可从 umo 的第 0 段拿到
-        platform_id = None
-        try:
-            platform_id = umo.split(":", 1)[0]
-        except Exception:
-            platform_id = None
-
-        return await self.context.conversation_manager.new_conversation(
-            unified_msg_origin=umo,
-            platform_id=platform_id,
-        )
-
-    async def _append_user_assistant_to_conversation(
-        self,
-        *,
-        event: AstrMessageEvent,
-        user_text: str,
-        assistant_text: str,
-    ) -> None:
-        """方案B：手动把 user/assistant 写入当前会话的 conversation。"""
-        cid = await self._ensure_conversation_id(event)
-        if not cid:
-            return
-
-        await self.context.conversation_manager.add_message_pair(
-            cid=cid,
-            user_message=UserMessageSegment(content=user_text),
-            assistant_message=AssistantMessageSegment(content=assistant_text),
-        )
-
     @filter.command("md")
-    async def cmd_md(self, event: AstrMessageEvent, content: GreedyStr = ""):
-        """处理 /md 指令，将后续内容发送给 LLM 并将回复转换为图片
-        
-        用法：/md <你的问题>
-        示例：/md 请用Python写一个快速排序算法
-        """
-        # 标记该事件需要进行 md2img 处理
-        event.set_extra("md2img_enabled", True)
+    async def md(self, event: AstrMessageEvent, prompt: GreedyStr = ""):
+        """仅在本次请求中开启 <md> 渲染规则注入，用法：/md <你的问题/内容>"""
+        event.should_call_llm(False)  # 禁用默认 LLM 请求，改由此指令主动发起
 
-        content = (content or "").strip()
-        if not content:
-            yield event.plain_result(
-                "请在 /md 后面输入你的问题\n\n用法：/md <你的问题>\n示例：/md 请用Python写一个快速排序算法",
-            )
+        prompt_text = str(prompt).strip()
+        if not prompt_text:
+            yield event.plain_result("用法：/md <你的问题/内容>\n例如：/md 请用表格总结以下内容…").stop_event()
             return
 
-        # 记录原始用户输入（保留 /md 前缀，方便还原真实提问）
-        event.set_extra("md2img_user_input", f"/md {content}".strip())
+        # 标记本次 LLM 请求需要注入 <md> 使用规则
+        event.set_extra("_md2img_inject", True)
 
-        # 将用户的问题发送给 LLM
-        yield event.request_llm(
-            prompt=content,
-            func_tool_manager=self.context.get_llm_tool_manager(),
-        )
+        # 将这次 /md 的请求与回复记录到 AstrBot 的 conversation 中。
+        # 注意：这里写入的是 user prompt（不包含 /md），assistant 的内容会在 on_decorating_result 阶段
+        # 被替换为“文本 + 图片(image_url parts)”的最终可见版本。
+        conversation = None
+        cid = None
+        try:
+            conv_mgr = getattr(self.context, "conversation_manager", None)
+            if conv_mgr is not None:
+                cid = await conv_mgr.get_curr_conversation_id(event.unified_msg_origin)
+                if not cid:
+                    platform_id = None
+                    try:
+                        if hasattr(event, "get_platform_id"):
+                            platform_id = event.get_platform_id()
+                    except Exception:
+                        platform_id = None
+
+                    cid = await conv_mgr.new_conversation(
+                        event.unified_msg_origin,
+                        platform_id=platform_id,
+                    )
+
+                # 获取对话对象（不同 AstrBot 版本的 get_conversation 参数可能不同，这里尽量只用必需参数）
+                conversation = await conv_mgr.get_conversation(
+                    event.unified_msg_origin,
+                    cid,
+                )
+        except Exception as e:
+            logger.warning(f"获取/创建对话失败，将不会记录 /md 到 conversation: {e}")
+
+        if cid:
+            event.set_extra("_md2img_conversation_id", cid)
+            event.set_extra("_md2img_prompt_text", prompt_text)
+
+        yield event.request_llm(prompt=prompt_text, conversation=conversation)
 
     @filter.on_llm_request()
     async def on_llm_req(self, event: AstrMessageEvent, req: ProviderRequest):
-        """向 LLM 注入使用 Markdown 转图片功能的指令（仅在 /md 指令触发时）"""
-        # 只有在 /md 指令触发时才注入 prompt
-        if not event.get_extra("md2img_enabled"):
+        """向 LLM 注入使用 Markdown 转图片功能的指令"""
+        if not event.get_extra("_md2img_inject", False):
             return
-        
+
         instruction_prompt = """
 当你需要发送包含复杂格式（如代码块、表格、嵌套列表等）的内容时，为了获得更好的显示效果，你可以将这部分内容渲染成一张图片。
 
 使用规则：
 1. 将你需要转换为图片的 Markdown 全文内容包裹在 `<md>` 和 `</md>` 标签之间。
 2. LLM应自行判断何时使用该功能，通常用于格式复杂、纯文本难以阅读的场景。
-3. 标签内的内容应为完整的、格式正确的 Markdown 文本。
-4. **必须严格确保标签闭合**：必须有且仅有一对 `<md>` 和 `</md>` 标签。
-5. **标签必须独占一行**：`<md>` 和 `</md>` 标签应各自单独占据一行。
-6. **标签内不能嵌套**：`<md>` 标签内部不能再包含 `<md>` 或 `</md>` 标签。
+3. 标签内的内容应为完整的、格式正确的 Markdown 文本,`<md>` 和 `</md>`标签必须成对出现且不能嵌套。
 
-正确示例：
+例如：
 <md>
 # 这是一个标题
 
@@ -301,139 +309,136 @@ def hello_world():
 ```
 </md>
 """
-        # 参考 t0saki 插件的注入方式：优先追加在已有 system prompt，避免覆盖人设；
-        # 如果 system prompt 为空，则前置到 user prompt，保证 md 指令仍可生效。
-        instruction_prompt = instruction_prompt.strip()
-        if req.system_prompt:
-            req.system_prompt = f"{req.system_prompt}\n\n{instruction_prompt}"
-        else:
-            req.user_prompt = f"{instruction_prompt}\n\n{(req.user_prompt or '').strip()}".strip()
+        # 将指令添加到 system prompt 的末尾
+        req.system_prompt += f"\\n\\n{instruction_prompt}"
 
     @filter.on_llm_response()
     async def on_llm_resp(self, event: AstrMessageEvent, resp: LLMResponse):
-        """将原始响应暂存（仅在 /md 指令触发时）"""
-        # 只有在 /md 指令触发时才处理
-        if not event.get_extra("md2img_enabled"):
-            return
-            
-        # 保存 LLM 的原始响应
+        """将原始响应暂存，以便后续处理"""
+        # 这一步是为了将 LLM 的原始响应（可能包含<md>标签）保存到事件上下文中
         event.set_extra("raw_llm_completion_text", resp.completion_text)
 
     @filter.on_decorating_result()
     async def on_decorating_result(self, event: AstrMessageEvent):
-        """在最终消息链生成阶段，解析并替换 <md> 标签（仅在 /md 指令触发时）"""
-        # 只有在 /md 指令触发时才处理
-        if not event.get_extra("md2img_enabled"):
-            return
-            
+        """在最终消息链生成阶段，解析并替换 <md> 标签"""
         result = event.get_result()
-        # 检查 result 是否存在且有 chain
-        if result is None or not result.chain:
-            return
-            
         chain = result.chain
         new_chain = []
-        # 收集用于 conversation 写入的最终文本，确保图片已替换
-        conversation_text_parts = []
         for item in chain:
             # 我们只处理纯文本部分
             if isinstance(item, Plain):
                 # 调用核心处理函数
                 components = await self._process_text_with_markdown(item.text)
                 new_chain.extend(components)
-                conversation_text_parts.append(self._components_to_plaintext(components))
             else:
                 new_chain.append(item)
-                conversation_text_parts.append(self._components_to_plaintext([item]))
         result.chain = new_chain
 
-        # 在 Markdown 替换为图片后再写入 conversation
-        if not event.get_extra("md2img_conversation_logged"):
-            user_text = (event.get_extra("md2img_user_input") or "").strip()
-            assistant_text = "".join(conversation_text_parts).strip()
-            if user_text and assistant_text:
-                try:
-                    await self._append_user_assistant_to_conversation(
-                        event=event,
-                        user_text=user_text,
-                        assistant_text=assistant_text,
-                    )
-                    event.set_extra("md2img_conversation_logged", True)
-                except Exception as e:
-                    logger.error(f"写入 conversation 失败: {e}")
+        # 如果是 /md 触发的请求：把 conversation 中最后一条 assistant 消息更新为“装饰后”的内容
+        # （Plain -> text part，Image -> image_url part），用于对话记录展示/导出。
+        if not event.get_extra("_md2img_inject", False):
+            return
 
-    def _components_to_plaintext(self, components: List) -> str:
-        """将最终组件序列转为可写入会话的文本。"""
-        parts = []
-        for comp in components:
+        cid = event.get_extra("_md2img_conversation_id")
+        if not cid:
+            return
+
+        conv_mgr = getattr(self.context, "conversation_manager", None)
+        if conv_mgr is None:
+            return
+
+        # 组装 OpenAI-style content parts
+        parts: list[dict] = []
+        for comp in result.chain:
             if isinstance(comp, Plain):
-                parts.append(comp.text)
+                if comp.text:
+                    parts.append({"type": "text", "text": comp.text})
             elif isinstance(comp, Image):
-                parts.append("[MD图片]")
-            else:
-                parts.append(str(comp))
-        return "".join(parts)
+                # 注意：register_to_file_service() 使用的是一次性 token（被访问后会失效），
+                # 不适合持久化到 conversation 历史中。
+                # 这里使用 base64 data URI，保证对话历史可长期回看。
+                try:
+                    bs64 = await comp.convert_to_base64()
+                    if bs64:
+                        url = f"data:image/png;base64,{bs64}"
+                        parts.append({"type": "image_url", "image_url": {"url": url}})
+                except Exception:
+                    pass
 
-    def _clean_unclosed_md_tags(self, text: str) -> str:
-        """
-        清理未闭合的 md 标签，将其转换为可读的文本格式，避免显示格式错误。
-        """
-        # 尝试修复：将未闭合的 <md> 替换为可读提示
-        # 首先找到所有完整闭合的标签对
-        closed_pattern = r'<md>(.*?)</md>'
-        
-        # 保护已闭合的标签，暂时替换为占位符
-        placeholders = {}
-        counter = [0]
-        
-        def save_closed(match):
-            key = f"__MD_PLACEHOLDER_{counter[0]}__"
-            placeholders[key] = match.group(0)
-            counter[0] += 1
-            return key
-        
-        protected_text = re.sub(closed_pattern, save_closed, text, flags=re.DOTALL)
-        
-        # 清理剩余的未闭合标签
-        # 替换孤立的 <md> 为 "[Markdown开始]"
-        protected_text = re.sub(r'<md>', '[Markdown内容开始]', protected_text)
-        # 替换孤立的 </md> 为 "[Markdown结束]"
-        protected_text = re.sub(r'</md>', '[Markdown内容结束]', protected_text)
-        
-        # 恢复已闭合的标签
-        for key, value in placeholders.items():
-            protected_text = protected_text.replace(key, value)
-        
-        return protected_text
+        if not parts:
+            return
+
+        try:
+            conv = await conv_mgr.get_conversation(event.unified_msg_origin, cid)
+            if not conv or not getattr(conv, "history", None):
+                return
+
+            history = json.loads(conv.history)
+            if not isinstance(history, list) or not history:
+                return
+
+            prompt_text = event.get_extra("_md2img_prompt_text")
+
+            def _match_user_prompt(rec: dict) -> bool:
+                if not prompt_text:
+                    return False
+                if rec.get("role") != "user":
+                    return False
+                content = rec.get("content")
+                if content == prompt_text:
+                    return True
+                if isinstance(content, list):
+                    # OpenAI parts
+                    for item in content:
+                        if isinstance(item, dict) and item.get("type") == "text" and item.get("text") == prompt_text:
+                            return True
+                return False
+
+            # 优先定位“本次 user prompt”的下一个 assistant
+            user_index = None
+            for i in range(len(history) - 1, -1, -1):
+                rec = history[i]
+                if isinstance(rec, dict) and _match_user_prompt(rec):
+                    user_index = i
+                    break
+
+            updated = False
+            if user_index is not None:
+                for j in range(user_index + 1, len(history)):
+                    rec = history[j]
+                    if isinstance(rec, dict) and rec.get("role") == "assistant":
+                        rec["content"] = parts
+                        updated = True
+                        break
+
+            # 回退：从后往前找到最后一条 assistant
+            if not updated:
+                for i in range(len(history) - 1, -1, -1):
+                    rec = history[i]
+                    if isinstance(rec, dict) and rec.get("role") == "assistant":
+                        rec["content"] = parts
+                        updated = True
+                        break
+
+            if not updated:
+                return
+
+            await conv_mgr.update_conversation(
+                event.unified_msg_origin,
+                cid,
+                history=history,
+            )
+        except Exception as e:
+            logger.warning(f"更新 conversation 的 /md 装饰后内容失败: {e}")
 
     async def _process_text_with_markdown(self, text: str) -> List:
         """
         处理包含 <md>...</md> 标签的文本。
         将其分割成 Plain 和 Image 组件的列表。
-        增加了强约束校验，确保标签完美闭合。
         """
         components = []
-        
-        # 先进行标签校验
-        open_count = len(re.findall(r'<md>', text))
-        close_count = len(re.findall(r'</md>', text))
-        
-        # 如果标签数量不匹配，直接返回原文本，不进行处理
-        if open_count != close_count:
-            logger.warning(f"Markdown 标签不匹配: <md> 出现 {open_count} 次, </md> 出现 {close_count} 次。将原样输出文本。")
-            # 移除未闭合的标签，避免显示格式错误
-            cleaned_text = self._clean_unclosed_md_tags(text)
-            return [Plain(cleaned_text)]
-        
-        # 检查是否存在嵌套标签（简化检测：检查标签之间是否有另一个开始标签）
-        nested_pattern = r'<md>[^<]*<md>'
-        if re.search(nested_pattern, text, flags=re.DOTALL):
-            logger.warning("检测到嵌套的 <md> 标签，将原样输出文本。")
-            cleaned_text = self._clean_unclosed_md_tags(text)
-            return [Plain(cleaned_text)]
-        
-        # 使用更严格的正则表达式来匹配完整闭合的标签
-        # 确保 <md> 和 </md> 是完整的标签
+        # 使用 re.split 来分割文本，保留分隔符（<md>...</md>）
+        # re.DOTALL 使得 '.' 可以匹配包括换行符在内的任意字符
         pattern = r"(<md>.*?</md>)"
         parts = re.split(pattern, text, flags=re.DOTALL)
 
@@ -478,4 +483,22 @@ def hello_world():
                 components.append(Plain(part))
 
         return components
+    
 
+if __name__ == "__main__":
+    # 生成一个固定宽度的图片
+    output_file_fixed_width = f"markdown_width_{uuid.uuid4().hex[:6]}.png"
+    asyncio.run(markdown_to_image_playwright(
+        markdown_string,
+        output_file_fixed_width,
+        scale=2,
+        width=1000  # 设置宽度为 600px
+    ))
+
+    # 生成一个自适应宽度的图片(不设置 width 参数)
+    output_file_auto_width = f"markdown_auto_{uuid.uuid4().hex[:6]}.png"
+    asyncio.run(markdown_to_image_playwright(
+        markdown_string,
+        output_file_auto_width,
+        scale=2
+    ))
