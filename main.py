@@ -302,7 +302,7 @@ def hello_world():
 </md>
 """
         # 追加而非覆盖，确保保留 AstrBot 原有人设/系统提示
-        req.system_prompt = (req.system_prompt or "") + f"\n\n{instruction_prompt}"
+        req.user_prompt = f"{instruction_prompt}\n\n{req.user_prompt}"
 
     @filter.on_llm_response()
     async def on_llm_resp(self, event: AstrMessageEvent, resp: LLMResponse):
