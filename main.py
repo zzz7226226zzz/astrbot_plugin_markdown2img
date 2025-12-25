@@ -259,9 +259,8 @@ class MarkdownConverterPlugin(Star):
             )
             return
 
-        # 记录本次 user 输入（去掉 /md 前缀后即 content）
-        # 先暂存，等拿到 LLM 输出后再成对写入，避免半截历史。
-        event.set_extra("md2img_user_input", content)
+        # 记录原始用户输入（保留 /md 前缀，方便在会话中还原真实提问）
+        event.set_extra("md2img_user_input", f"/md {content}".strip())
 
         # 将用户的问题发送给 LLM
         yield event.request_llm(
@@ -302,8 +301,8 @@ def hello_world():
 ```
 </md>
 """
-        # 将指令添加到 system prompt 的末尾
-        req.system_prompt += f"\n\n{instruction_prompt}"
+        # 追加而非覆盖，确保保留 AstrBot 原有人设/系统提示
+        req.system_prompt = (req.system_prompt or "") + f"\n\n{instruction_prompt}"
 
     @filter.on_llm_response()
     async def on_llm_resp(self, event: AstrMessageEvent, resp: LLMResponse):
