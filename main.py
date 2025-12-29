@@ -2,6 +2,7 @@ import os
 import re
 import uuid
 import json
+import hashlib
 from typing import List
 
 
@@ -234,6 +235,12 @@ class MarkdownConverterPlugin(Star):
     @filter.command("md")
     async def md(self, event: AstrMessageEvent, prompt: GreedyStr = ""):
         """仅在本次请求中开启 <md> 渲染规则注入，用法：/md <你的问题/内容>"""
+        # 防止某些平台/适配器在同一条消息上触发两次命令处理
+        if event.get_extra("_md2img_cmd_processed", False):
+            yield event.plain_result("(md2img) 本条 /md 指令已处理，忽略重复触发。").stop_event()
+            return
+        event.set_extra("_md2img_cmd_processed", True)
+
         event.should_call_llm(False)  # 禁用默认 LLM 请求，改由此指令主动发起
 
         prompt_text = str(prompt).strip()
@@ -278,7 +285,9 @@ class MarkdownConverterPlugin(Star):
             event.set_extra("_md2img_conversation_id", cid)
             event.set_extra("_md2img_prompt_text", prompt_text)
 
-        yield event.request_llm(prompt=prompt_text, conversation=conversation)
+        # 重要：结束默认流水线，避免“命令处理 + 普通消息处理”两条链路都跑
+        # 注意：必须在 md() 方法体内
+        yield event.request_llm(prompt=prompt_text, conversation=conversation).stop_event()
 
     @filter.on_llm_request()
     async def on_llm_req(self, event: AstrMessageEvent, req: ProviderRequest):
@@ -315,13 +324,26 @@ def hello_world():
     @filter.on_llm_response()
     async def on_llm_resp(self, event: AstrMessageEvent, resp: LLMResponse):
         """将原始响应暂存，以便后续处理"""
+        if not event.get_extra("_md2img_inject", False):
+            return
         # 这一步是为了将 LLM 的原始响应（可能包含<md>标签）保存到事件上下文中
         event.set_extra("raw_llm_completion_text", resp.completion_text)
 
     @filter.on_decorating_result()
     async def on_decorating_result(self, event: AstrMessageEvent):
         """在最终消息链生成阶段，解析并替换 <md> 标签"""
+        if not event.get_extra("_md2img_inject", False):
+            return
+
+        # 防重复：同一事件的 decorating 可能被框架触发多次（例如重试/二次装饰）。
+        # 若已完成一次渲染，就直接跳过，避免重复截图。
+        if event.get_extra("_md2img_decorated", False):
+            return
+        event.set_extra("_md2img_decorated", True)
+
         result = event.get_result()
+        if result is None or not getattr(result, "chain", None):
+            return
         chain = result.chain
         new_chain = []
         for item in chain:
@@ -334,10 +356,8 @@ def hello_world():
                 new_chain.append(item)
         result.chain = new_chain
 
-        # 如果是 /md 触发的请求：把 conversation 中最后一条 assistant 消息更新为“装饰后”的内容
-        # （Plain -> text part，Image -> image_url part），用于对话记录展示/导出。
-        if not event.get_extra("_md2img_inject", False):
-            return
+    # /md 触发的请求：把 conversation 中最后一条 assistant 消息更新为“装饰后”的内容
+    # （Plain -> text part，Image -> image_url part），用于对话记录展示/导出。
 
         cid = event.get_extra("_md2img_conversation_id")
         if not cid:
@@ -454,18 +474,20 @@ def hello_world():
                 if not md_content:
                     continue
 
-                # 生成一个唯一的图片文件名
-                image_filename = f"{uuid.uuid4()}.png"
-                output_path = os.path.join(self.IMAGE_CACHE_DIR, image_filename)
+                # 基于内容的缓存：同样的 md_content 不重复渲染
+                md_hash = hashlib.sha256(md_content.encode("utf-8")).hexdigest()
+                output_path = os.path.join(self.IMAGE_CACHE_DIR, f"{md_hash}.png")
 
                 try:
-                    # 调用库函数生成图片
-                    await markdown_to_image_playwright(
-                        md_text=md_content,
-                        output_image_path=output_path,
-                        scale=2,  # 2倍缩放以获得更高清的图片
-                        width=600  # 固定宽度为600px，内容过长会自动换行
-                    )
+                    # 如果缓存已存在且非空，直接复用
+                    if not (os.path.exists(output_path) and os.path.getsize(output_path) > 0):
+                        # 调用库函数生成图片
+                        await markdown_to_image_playwright(
+                            md_text=md_content,
+                            output_image_path=output_path,
+                            scale=2,  # 2倍缩放以获得更高清的图片
+                            width=600  # 固定宽度为600px，内容过长会自动换行
+                        )
 
                     if os.path.exists(output_path):
                         # 如果图片成功生成，则添加到组件列表中
