@@ -298,14 +298,19 @@ class MarkdownConverterPlugin(Star):
             event.set_extra("_md2img_conversation_id", cid)
             event.set_extra("_md2img_prompt_text", prompt_text)
 
-        # 重要：结束默认流水线，避免“命令处理 + 普通消息处理”两条链路都跑
-        # 注意：必须在 md() 方法体内
-        event.stop_event()
-        yield event.request_llm(
+        # 重要：禁用默认 LLM 请求，并把 provider_request 注入到 event 上交由核心流水线处理。
+        # 参考：AstrBot/astrbot/core/pipeline/process_stage/method/agent_sub_stages/internal.py
+        event.should_call_llm(False)
+        req = event.request_llm(
             prompt=prompt_text,
             conversation=conversation,
             func_tool_manager=self.context.get_llm_tool_manager(),
         )
+        event.set_extra("provider_request", req)
+
+        # 终止事件继续传播，避免同一条消息走两条链路。
+        event.stop_event()
+        return
 
     @filter.on_llm_request()
     async def on_llm_req(self, event: AstrMessageEvent, req: ProviderRequest):
