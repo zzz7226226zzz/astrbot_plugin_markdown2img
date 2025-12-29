@@ -248,7 +248,8 @@ class MarkdownConverterPlugin(Star):
         """仅在本次请求中开启 <md> 渲染规则注入，用法：/md <你的问题/内容>"""
         # 防止某些平台/适配器在同一条消息上触发两次命令处理
         if event.get_extra("_md2img_cmd_processed", False):
-            yield event.plain_result("(md2img) 本条 /md 指令已处理，忽略重复触发。").stop_event()
+            yield event.plain_result("(md2img) 本条 /md 指令已处理，忽略重复触发。")
+            event.stop_event()
             return
         event.set_extra("_md2img_cmd_processed", True)
 
@@ -256,7 +257,8 @@ class MarkdownConverterPlugin(Star):
 
         prompt_text = str(prompt).strip()
         if not prompt_text:
-            yield event.plain_result("用法：/md <你的问题/内容>\n例如：/md 请用表格总结以下内容…").stop_event()
+            yield event.plain_result("用法：/md <你的问题/内容>\n例如：/md 请用表格总结以下内容…")
+            event.stop_event()
             return
 
         # 标记本次 LLM 请求需要注入 <md> 使用规则
@@ -298,7 +300,12 @@ class MarkdownConverterPlugin(Star):
 
         # 重要：结束默认流水线，避免“命令处理 + 普通消息处理”两条链路都跑
         # 注意：必须在 md() 方法体内
-        yield event.request_llm(prompt=prompt_text, conversation=conversation).stop_event()
+        event.stop_event()
+        yield event.request_llm(
+            prompt=prompt_text,
+            conversation=conversation,
+            func_tool_manager=self.context.get_llm_tool_manager(),
+        )
 
     @filter.on_llm_request()
     async def on_llm_req(self, event: AstrMessageEvent, req: ProviderRequest):
