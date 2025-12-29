@@ -182,7 +182,7 @@ class MarkdownConverterPlugin(Star):
             # This function starts a subprocess without blocking the event loop.
 
             # Helper function to run a command and log its output
-            async def run_playwright_command(command: list, description: str):
+            async def run_playwright_command(command: list, description: str, *, timeout_sec: int = 600):
                 process = await asyncio.create_subprocess_exec(
                     *command,
                     stdout=asyncio.subprocess.PIPE,
@@ -190,7 +190,15 @@ class MarkdownConverterPlugin(Star):
                 )
 
                 # Await the process to complete and capture the output
-                stdout, stderr = await process.communicate()
+                try:
+                    stdout, stderr = await asyncio.wait_for(process.communicate(), timeout=timeout_sec)
+                except asyncio.TimeoutError:
+                    try:
+                        process.kill()
+                    except Exception:
+                        pass
+                    logger.error(f"Playwright {description} 安装超时（{timeout_sec}s），已终止。")
+                    return False
 
                 if process.returncode != 0:
                     logger.error(
@@ -215,9 +223,12 @@ class MarkdownConverterPlugin(Star):
             await run_playwright_command(install_browser_cmd, "Chromium 浏览器")
 
             # Command to install system dependencies
-            install_deps_cmd = [sys.executable,
-                                "-m", "playwright", "install-deps"]
-            await run_playwright_command(install_deps_cmd, "系统依赖")
+            # install-deps 在不少部署环境（容器/无 root 权限/只读系统）会失败。
+            # 这里降级为“尽力而为”：失败只警告，不阻断插件加载。
+            install_deps_cmd = [sys.executable, "-m", "playwright", "install-deps"]
+            ok = await run_playwright_command(install_deps_cmd, "系统依赖")
+            if not ok:
+                logger.warning("Playwright 系统依赖安装失败/跳过：插件仍会加载，但首次渲染可能失败。请参考 Playwright 文档手动安装依赖。")
 
             logger.info("Markdown 转图片插件已初始化")
 
