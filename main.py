@@ -298,6 +298,8 @@ class MarkdownConverterPlugin(Star):
         # 重要：禁用默认 LLM 请求，并通过“yield ProviderRequest”走核心 ProcessStage 的 Handler LLM 分支。
         # 参考：AstrBot/astrbot/core/pipeline/process_stage/stage.py
         event.should_call_llm(False)
+        # 避免平台/适配器超时重试导致 RespondStage 在同一事件上重复发送
+        event.set_extra("_md2img_sent_once", False)
         req = event.request_llm(
             prompt=prompt_text,
             conversation=conversation,
@@ -355,6 +357,16 @@ def hello_world():
         if not event.get_extra("_md2img_inject", False):
             return
 
+        # 强幂等：如果底层平台超时但实际已送达，框架可能会重入 RespondStage 再次发送。
+        # 这里在装饰完成后直接标记“本事件的输出已准备并且只允许发送一次”，
+        # 若后续又进入装饰/发送流程，则把结果置空从而跳过发送。
+        if event.get_extra("_md2img_sent_once", False):
+            try:
+                event.clear_result()
+            except Exception:
+                pass
+            return
+
         # 防重复：同一事件的 decorating 可能被框架触发多次（例如重试/二次装饰）。
         # 若已完成一次渲染，就直接跳过，避免重复截图。
         if event.get_extra("_md2img_decorated", False):
@@ -390,6 +402,9 @@ def hello_world():
             result.chain = filtered_chain
         else:
             result.chain = new_chain
+
+        # 标记：本事件已经生成最终输出（防止平台超时重试导致二次发送）
+        event.set_extra("_md2img_sent_once", True)
 
         # conversation 历史同步部分保持不变
         cid = event.get_extra("_md2img_conversation_id")
