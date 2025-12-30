@@ -317,31 +317,35 @@ class MarkdownConverterPlugin(Star):
         if not event.get_extra("_md2img_inject", False):
             return
 
+        # 便于排查：确认该 Hook 在 /md 的 ProviderRequest 上被触发
+        logger.debug(
+            f"(md2img) on_llm_request triggered, prompt_len={len(req.prompt or '')}"
+        )
+
+        # 强制模式：/md 指令必须返回一个 <md>...</md>，否则无法稳定触发后续渲染。
+        # 说明：如果用户问题不适合长内容，也请输出一个最小可用的 <md>...
         instruction_prompt = """
-当你需要发送包含复杂格式（如代码块、表格、嵌套列表等）的内容时，为了获得更好的显示效果，你可以将这部分内容渲染成一张图片。
+你正在响应一个 `/md` 指令。
 
-使用规则：
-1. 将你需要转换为图片的 Markdown 全文内容包裹在 `<md>` 和 `</md>` 标签之间。
-2. LLM应自行判断何时使用该功能，通常用于格式复杂、纯文本难以阅读的场景。
-3. 标签内的内容应为完整的、格式正确的 Markdown 文本,`<md>` 和 `</md>`标签必须成对出现且不能嵌套。
+请严格遵守以下输出格式要求（必须满足）：
+1) 你的最终回答必须包含且只包含 **一段** `<md>` 与 `</md>` 标签包裹的 Markdown。
+2) `<md>` 标签外不要输出任何其它文字（包括解释、前后缀、致歉、提示语）。
+3) 标签内必须是可渲染的标准 Markdown（可包含表格/代码块/列表等）。
+4) 如果内容较长，允许在 Markdown 内做分页/分节（例如添加标题）。
 
-例如：
+输出示例（仅示例，实际内容按用户问题生成）：
 <md>
-# 这是一个标题
+# 标题
 
-这是一个列表:
-- 列表项 1
-- 列表项 2
-
-这是一个代码块:
-```python
-def hello_world():
-    print("Hello, World!")
-```
+正文...
 </md>
 """
-        # 将指令添加到 system prompt 的末尾
+
         req.system_prompt += f"\n\n{instruction_prompt}"
+
+        logger.debug(
+            f"(md2img) system_prompt appended, system_prompt_len={len(req.system_prompt or '')}"
+        )
 
     @filter.on_llm_response()
     async def on_llm_resp(self, event: AstrMessageEvent, resp: LLMResponse):
