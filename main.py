@@ -18,9 +18,6 @@ from astrbot.core.star.star_tools import StarTools
 import mistune
 import asyncio
 from playwright.async_api import async_playwright
-import uuid
-
-import subprocess
 import sys
 
 
@@ -133,7 +130,8 @@ async def markdown_to_image_playwright(
         print(f"图片已保存到: {output_image_path}")
 
 
-# --- 示例 ---
+
+# 仅用于本地调试（不会影响插件运行）
 markdown_string = """
 # Playwright 渲染测试
 
@@ -143,7 +141,7 @@ markdown_string = """
 
 独立公式：
 $$
-\\int_0^\\infty e^{-x^2} dx = \\frac{\\sqrt{\pi}}{2}
+\\int_0^\\infty e^{-x^2} dx = \\frac{\\sqrt{\\pi}}{2}
 $$
 
 以及一段 C++ 代码:
@@ -151,11 +149,13 @@ $$
 #include <iostream>
 
 int main() {
-    // 这是一段注释，用来增加代码块的宽度，以测试在固定宽度下的显示效果。
-    std::cout << "Hello, C++! This is a longer line to demonstrate wrapping or scrolling." << std::endl;
+    std::cout << "Hello, C++!" << std::endl;
     return 0;
 }
+```
 """
+
+
 
 @register(
     "astrbot_plugin_md2img",
@@ -286,11 +286,8 @@ class MarkdownConverterPlugin(Star):
                         platform_id=platform_id,
                     )
 
-                # 获取对话对象（不同 AstrBot 版本的 get_conversation 参数可能不同，这里尽量只用必需参数）
-                conversation = await conv_mgr.get_conversation(
-                    event.unified_msg_origin,
-                    cid,
-                )
+                # 获取对话对象（AstrBot 内部签名：get_conversation(unified_msg_origin, conversation_id)）
+                conversation = await conv_mgr.get_conversation(event.unified_msg_origin, cid)
         except Exception as e:
             logger.warning(f"获取/创建对话失败，将不会记录 /md 到 conversation: {e}")
 
@@ -308,6 +305,9 @@ class MarkdownConverterPlugin(Star):
         )
         yield req
         return
+
+    # 注意：这里不要 stop_event()。
+    # AstrBot 的 ProcessStage 会在看到 yield ProviderRequest 后进入 AgentSubStage 并产出最终结果。
 
     @filter.on_llm_request()
     async def on_llm_req(self, event: AstrMessageEvent, req: ProviderRequest):
@@ -338,8 +338,8 @@ def hello_world():
 ```
 </md>
 """
-        # 将指令添加到 system prompt 的末尾
-        req.system_prompt += f"\\n\\n{instruction_prompt}"
+    # 将指令添加到 system prompt 的末尾
+    req.system_prompt += f"\n\n{instruction_prompt}"
 
     @filter.on_llm_response()
     async def on_llm_resp(self, event: AstrMessageEvent, resp: LLMResponse):
@@ -367,18 +367,31 @@ def hello_world():
         chain = result.chain
         new_chain = []
         for item in chain:
-            # 我们只处理纯文本部分
+            # 只处理纯文本部分，遇到 <md> 标签就替换为图片，否则保留原有内容
             if isinstance(item, Plain):
-                # 调用核心处理函数
                 components = await self._process_text_with_markdown(item.text)
                 new_chain.extend(components)
             else:
                 new_chain.append(item)
-        result.chain = new_chain
 
-    # /md 触发的请求：把 conversation 中最后一条 assistant 消息更新为“装饰后”的内容
-    # （Plain -> text part，Image -> image_url part），用于对话记录展示/导出。
+        # 只保留渲染后的图片和非 <md> 纯文本，去除原始纯文本，防止重复消息
+        # 如果 new_chain 里有图片，则移除所有原始 Plain（只保留图片和非 <md> 部分）
+        has_img = any(isinstance(comp, Image) for comp in new_chain)
+        if has_img:
+            # 只保留图片和非 <md> 的 Plain
+            filtered_chain = []
+            for comp in new_chain:
+                if isinstance(comp, Image):
+                    filtered_chain.append(comp)
+                elif isinstance(comp, Plain):
+                    # 只保留不含 <md> 的纯文本
+                    if "<md>" not in comp.text and "</md>" not in comp.text:
+                        filtered_chain.append(comp)
+            result.chain = filtered_chain
+        else:
+            result.chain = new_chain
 
+        # conversation 历史同步部分保持不变
         cid = event.get_extra("_md2img_conversation_id")
         if not cid:
             return
@@ -394,9 +407,6 @@ def hello_world():
                 if comp.text:
                     parts.append({"type": "text", "text": comp.text})
             elif isinstance(comp, Image):
-                # 注意：register_to_file_service() 使用的是一次性 token（被访问后会失效），
-                # 不适合持久化到 conversation 历史中。
-                # 这里使用 base64 data URI，保证对话历史可长期回看。
                 try:
                     bs64 = await comp.convert_to_base64()
                     if bs64:
@@ -428,13 +438,11 @@ def hello_world():
                 if content == prompt_text:
                     return True
                 if isinstance(content, list):
-                    # OpenAI parts
                     for item in content:
                         if isinstance(item, dict) and item.get("type") == "text" and item.get("text") == prompt_text:
                             return True
                 return False
 
-            # 优先定位“本次 user prompt”的下一个 assistant
             user_index = None
             for i in range(len(history) - 1, -1, -1):
                 rec = history[i]
@@ -451,7 +459,6 @@ def hello_world():
                         updated = True
                         break
 
-            # 回退：从后往前找到最后一条 assistant
             if not updated:
                 for i in range(len(history) - 1, -1, -1):
                     rec = history[i]
