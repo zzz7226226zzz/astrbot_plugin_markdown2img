@@ -340,8 +340,8 @@ def hello_world():
 ```
 </md>
 """
-    # 将指令添加到 system prompt 的末尾
-    req.system_prompt += f"\n\n{instruction_prompt}"
+        # 将指令添加到 system prompt 的末尾
+        req.system_prompt += f"\n\n{instruction_prompt}"
 
     @filter.on_llm_response()
     async def on_llm_resp(self, event: AstrMessageEvent, resp: LLMResponse):
