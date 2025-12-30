@@ -513,13 +513,10 @@ def hello_world():
                         # 如果图片成功生成，则添加到组件列表中
                         components.append(Image.fromFileSystem(output_path))
                     else:
-                        # 如果生成失败，则将原始 Markdown 内容作为纯文本发送
+                        # 文件未生成，记录错误但不重发纯文本
                         logger.error(f"Markdown 图片生成失败，但文件未找到: {output_path}")
-                        components.append(Plain(f"--- Markdown 渲染失败 ---\n{md_content}"))
                 except Exception as e:
                     logger.error(f"调用 sync_markdown_to_image_playwright 异常: {e}")
-                    # 如果转换过程中发生异常，也回退到纯文本
-                    components.append(Plain(f"--- Markdown 渲染异常 ---\n{md_content}"))
             else:
                 # 如果不是标签，就是普通文本
                 components.append(Plain(part))
