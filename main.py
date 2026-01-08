@@ -363,29 +363,44 @@ class MarkdownConverterPlugin(Star):
     @filter.on_decorating_result()
     async def on_decorating_result(self, event: AstrMessageEvent):
         """在最终消息链生成阶段，解析并替换 <md> 标签"""
-        if not event.get_extra("_md2img_inject", False):
-            return
+        is_md_command = bool(event.get_extra("_md2img_inject", False))
 
-        # 强幂等：如果底层平台超时但实际已送达，框架可能会重入 RespondStage 再次发送。
-        # 这里在装饰完成后直接标记“本事件的输出已准备并且只允许发送一次”，
-        # 若后续又进入装饰/发送流程，则把结果置空从而跳过发送。
-        if event.get_extra("_md2img_sent_once", False):
-            try:
-                event.clear_result()
-            except Exception:
-                pass
-            return
+        # /md 路径的防重复与“只发送一次”保护保持不变；普通消息不启用这些门禁。
+        if is_md_command:
+            # 强幂等：如果底层平台超时但实际已送达，框架可能会重入 RespondStage 再次发送。
+            # 这里在装饰完成后直接标记“本事件的输出已准备并且只允许发送一次”，
+            # 若后续又进入装饰/发送流程，则把结果置空从而跳过发送。
+            if event.get_extra("_md2img_sent_once", False):
+                try:
+                    event.clear_result()
+                except Exception:
+                    pass
+                return
 
-        # 防重复：同一事件的 decorating 可能被框架触发多次（例如重试/二次装饰）。
-        # 若已完成一次渲染，就直接跳过，避免重复截图。
-        if event.get_extra("_md2img_decorated", False):
-            return
-        event.set_extra("_md2img_decorated", True)
+            # 防重复：同一事件的 decorating 可能被框架触发多次（例如重试/二次装饰）。
+            # 若已完成一次渲染，就直接跳过，避免重复截图。
+            if event.get_extra("_md2img_decorated", False):
+                return
+            event.set_extra("_md2img_decorated", True)
 
         result = event.get_result()
         if result is None or not getattr(result, "chain", None):
             return
         chain = result.chain
+
+        # 仅当消息里确实包含 <md> 标签时才进行拆分/渲染，避免对所有消息产生性能影响。
+        has_md_tag = any(
+            isinstance(item, Plain)
+            and ("<md>" in (item.text or ""))
+            and ("</md>" in (item.text or ""))
+            for item in chain
+        )
+        if not has_md_tag:
+            # /md 请求即使不需要渲染，也标记为已处理，防止超时重试导致重复发送。
+            if is_md_command:
+                event.set_extra("_md2img_sent_once", True)
+            return
+
         new_chain = []
         for item in chain:
             # 只处理纯文本部分，遇到 <md> 标签就替换为图片，否则保留原有内容
@@ -412,95 +427,100 @@ class MarkdownConverterPlugin(Star):
         else:
             result.chain = new_chain
 
-        # 标记：本事件已经生成最终输出（防止平台超时重试导致二次发送）
-        event.set_extra("_md2img_sent_once", True)
+        # 标记：/md 事件已经生成最终输出（防止平台超时重试导致二次发送）
+        if is_md_command:
+            event.set_extra("_md2img_sent_once", True)
 
-        # conversation 历史同步部分保持不变
-        cid = event.get_extra("_md2img_conversation_id")
-        if not cid:
-            return
-
-        conv_mgr = getattr(self.context, "conversation_manager", None)
-        if conv_mgr is None:
-            return
-
-        # 组装 OpenAI-style content parts
-        parts: list[dict] = []
-        for comp in result.chain:
-            if isinstance(comp, Plain):
-                if comp.text:
-                    parts.append({"type": "text", "text": comp.text})
-            elif isinstance(comp, Image):
-                try:
-                    bs64 = await comp.convert_to_base64()
-                    if bs64:
-                        url = f"data:image/png;base64,{bs64}"
-                        parts.append({"type": "image_url", "image_url": {"url": url}})
-                except Exception:
-                    pass
-
-        if not parts:
-            return
-
-        try:
-            conv = await conv_mgr.get_conversation(event.unified_msg_origin, cid)
-            if not conv or not getattr(conv, "history", None):
+            # conversation 历史同步仅针对 /md
+            cid = event.get_extra("_md2img_conversation_id")
+            if not cid:
                 return
 
-            history = json.loads(conv.history)
-            if not isinstance(history, list) or not history:
+            conv_mgr = getattr(self.context, "conversation_manager", None)
+            if conv_mgr is None:
                 return
 
-            prompt_text = event.get_extra("_md2img_prompt_text")
+            # 组装 OpenAI-style content parts
+            parts: list[dict] = []
+            for comp in result.chain:
+                if isinstance(comp, Plain):
+                    if comp.text:
+                        parts.append({"type": "text", "text": comp.text})
+                elif isinstance(comp, Image):
+                    try:
+                        bs64 = await comp.convert_to_base64()
+                        if bs64:
+                            url = f"data:image/png;base64,{bs64}"
+                            parts.append({"type": "image_url", "image_url": {"url": url}})
+                    except Exception:
+                        pass
 
-            def _match_user_prompt(rec: dict) -> bool:
-                if not prompt_text:
+            if not parts:
+                return
+
+            try:
+                conv = await conv_mgr.get_conversation(event.unified_msg_origin, cid)
+                if not conv or not getattr(conv, "history", None):
+                    return
+
+                history = json.loads(conv.history)
+                if not isinstance(history, list) or not history:
+                    return
+
+                prompt_text = event.get_extra("_md2img_prompt_text")
+
+                def _match_user_prompt(rec: dict) -> bool:
+                    if not prompt_text:
+                        return False
+                    if rec.get("role") != "user":
+                        return False
+                    content = rec.get("content")
+                    if content == prompt_text:
+                        return True
+                    if isinstance(content, list):
+                        for item in content:
+                            if (
+                                isinstance(item, dict)
+                                and item.get("type") == "text"
+                                and item.get("text") == prompt_text
+                            ):
+                                return True
                     return False
-                if rec.get("role") != "user":
-                    return False
-                content = rec.get("content")
-                if content == prompt_text:
-                    return True
-                if isinstance(content, list):
-                    for item in content:
-                        if isinstance(item, dict) and item.get("type") == "text" and item.get("text") == prompt_text:
-                            return True
-                return False
 
-            user_index = None
-            for i in range(len(history) - 1, -1, -1):
-                rec = history[i]
-                if isinstance(rec, dict) and _match_user_prompt(rec):
-                    user_index = i
-                    break
-
-            updated = False
-            if user_index is not None:
-                for j in range(user_index + 1, len(history)):
-                    rec = history[j]
-                    if isinstance(rec, dict) and rec.get("role") == "assistant":
-                        rec["content"] = parts
-                        updated = True
-                        break
-
-            if not updated:
+                user_index = None
                 for i in range(len(history) - 1, -1, -1):
                     rec = history[i]
-                    if isinstance(rec, dict) and rec.get("role") == "assistant":
-                        rec["content"] = parts
-                        updated = True
+                    if isinstance(rec, dict) and _match_user_prompt(rec):
+                        user_index = i
                         break
 
-            if not updated:
-                return
+                updated = False
+                if user_index is not None:
+                    for j in range(user_index + 1, len(history)):
+                        rec = history[j]
+                        if isinstance(rec, dict) and rec.get("role") == "assistant":
+                            rec["content"] = parts
+                            updated = True
+                            break
 
-            await conv_mgr.update_conversation(
-                event.unified_msg_origin,
-                cid,
-                history=history,
-            )
-        except Exception as e:
-            logger.warning(f"更新 conversation 的 /md 装饰后内容失败: {e}")
+                if not updated:
+                    for i in range(len(history) - 1, -1, -1):
+                        rec = history[i]
+                        if isinstance(rec, dict) and rec.get("role") == "assistant":
+                            rec["content"] = parts
+                            updated = True
+                            break
+
+                if not updated:
+                    return
+
+                await conv_mgr.update_conversation(
+                    event.unified_msg_origin,
+                    cid,
+                    history=history,
+                )
+            except Exception as e:
+                logger.warning(f"更新 conversation 的 /md 装饰后内容失败: {e}")
 
     async def _process_text_with_markdown(self, text: str) -> List:
         """
